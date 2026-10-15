@@ -108,6 +108,10 @@ type Proxy struct {
 	connsPerIP    map[string]int
 	totalAccepted uint64
 	totalRejected uint64
+
+	// Fingerprint log throttling to prevent terminal spam
+	loggedMu sync.Mutex
+	loggedFP map[string]time.Time
 }
 
 // NewProxy creates and initializes a Proxy.
@@ -138,6 +142,7 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		certCloner:      cloner,
 		stopChan:        make(chan struct{}),
 		connsPerIP:      make(map[string]int),
+		loggedFP:        make(map[string]time.Time),
 	}, nil
 }
 
@@ -220,6 +225,10 @@ func (p *Proxy) Stop() {
 	p.whitelist.Clear()
 	p.confirmedAnyTLS.Clear()
 	p.certCloner.Clear()
+
+	p.loggedMu.Lock()
+	p.loggedFP = make(map[string]time.Time)
+	p.loggedMu.Unlock()
 }
 
 func (p *Proxy) acceptLoop() {
@@ -498,38 +507,57 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		p.confirmedAnyTLS.Add(origDst)
 		p.whitelist.Remove(origDst)
 
-		if matched {
-			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
-				clientAddr, origDst, sni, authHash)
+		p.loggedMu.Lock()
+		lastLogged, alreadyLogged := p.loggedFP[origDst]
+		shouldLogDetails := !alreadyLogged || time.Since(lastLogged) > 5*time.Minute
+		if shouldLogDetails {
+			p.loggedFP[origDst] = time.Now()
+		}
+		p.loggedMu.Unlock()
 
-			var fpDetails []string
-			if clientFingerprint != nil {
-				fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
-				if clientFingerprint.HasGREASE {
-					fpDetails = append(fpDetails, "GREASE=True")
+		if matched {
+			if shouldLogDetails {
+				log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
+					clientAddr, origDst, sni, authHash)
+
+				var fpDetails []string
+				if clientFingerprint != nil {
+					fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
+					if clientFingerprint.HasGREASE {
+						fpDetails = append(fpDetails, "GREASE=True")
+					}
+					if len(clientFingerprint.ALPN) > 0 {
+						fpDetails = append(fpDetails, fmt.Sprintf("ALPN=%v", clientFingerprint.ALPN))
+					}
+					if clientFingerprint.JA3Hash != "" {
+						fpDetails = append(fpDetails, fmt.Sprintf("JA3=%s", clientFingerprint.JA3Hash))
+					}
 				}
-				if len(clientFingerprint.ALPN) > 0 {
-					fpDetails = append(fpDetails, fmt.Sprintf("ALPN=%v", clientFingerprint.ALPN))
+				if meta != nil && meta.ClientApp != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("ClientApp: %q", meta.ClientApp))
 				}
-				if clientFingerprint.JA3Hash != "" {
-					fpDetails = append(fpDetails, fmt.Sprintf("JA3=%s", clientFingerprint.JA3Hash))
+				if meta != nil && meta.Version != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("Ver: %s", meta.Version))
 				}
+				if meta != nil && meta.PaddingMD5 != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
+				}
+				if len(fpDetails) > 0 {
+					log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
+				}
+			} else if p.config.Verbose {
+				log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s (Multiplexed stream)",
+					clientAddr, origDst, sni)
 			}
-			if meta != nil && meta.ClientApp != "" {
-				fpDetails = append(fpDetails, fmt.Sprintf("ClientApp: %q", meta.ClientApp))
-			}
-			if meta != nil && meta.Version != "" {
-				fpDetails = append(fpDetails, fmt.Sprintf("Ver: %s", meta.Version))
-			}
-			if meta != nil && meta.PaddingMD5 != "" {
-				fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
-			}
-			if len(fpDetails) > 0 {
-				log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
-			}
-		} else {
+		} else if p.config.Verbose {
 			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s (Confirmed AnyTLS session)",
 				clientAddr, origDst, sni)
+		}
+	} else {
+		// Decrypted stream did not match AnyTLS protocol (e.g. plaintext HTTP GET/POST/PRI from browser)
+		if !p.confirmedAnyTLS.Contains(origDst) {
+			p.whitelist.Add(origDst)
+			log.Printf("[WHITELIST-BYPASS] Host %s detected as standard web traffic (non-AnyTLS). Added to whitelist for direct Raw TCP bypass.", origDst)
 		}
 	}
 
@@ -549,25 +577,36 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 
 	go func() {
 		defer wg.Done()
-		defer uTLS.Close()
-		defer downstreamTLS.Close()
 		c2uBytes, c2uErr := io.Copy(uTLS, brDecrypted)
 		if p.config.Verbose {
 			log.Printf("[Proxy-Relay] Client -> Upstream stream ended: copied %d bytes, err: %v", c2uBytes, c2uErr)
 		}
+		if c2uErr != nil {
+			_ = downstreamTLS.Close()
+			_ = uTLS.Close()
+			return
+		}
+		// Graceful EOF from client: give upstream server time to finish transmitting response
+		_ = uTLS.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}()
 
 	go func() {
 		defer wg.Done()
-		defer downstreamTLS.Close()
-		defer uTLS.Close()
 		u2cBytes, u2cErr := io.Copy(downstreamTLS, uTLS)
 		if p.config.Verbose {
 			log.Printf("[Proxy-Relay] Upstream -> Client stream ended: copied %d bytes, err: %v", u2cBytes, u2cErr)
 		}
+		if u2cErr != nil {
+			_ = downstreamTLS.Close()
+			_ = uTLS.Close()
+			return
+		}
+		_ = downstreamTLS.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}()
 
 	wg.Wait()
+	_ = uTLS.Close()
+	_ = downstreamTLS.Close()
 	if p.config.Verbose {
 		log.Printf("[Proxy] Connection closed: %s <-> %s", clientAddr, origDst)
 	}
