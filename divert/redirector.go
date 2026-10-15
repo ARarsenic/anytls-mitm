@@ -244,16 +244,10 @@ func (r *Redirector) forwardLoop() {
 			clientKey := net.JoinHostPort(srcIP.String(), strconv.Itoa(int(srcPort)))
 			origDst := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(dstPort)))
 
+			r.natTable.Set(clientKey, origDst)
+
 			tcpFlags := buf[ihl+13]
 			isSYN := (tcpFlags&0x02 != 0) && (tcpFlags&0x10 == 0)
-			isRST := (tcpFlags & 0x04) != 0
-
-			if isSYN {
-				r.natTable.Set(clientKey, origDst)
-			} else if isRST {
-				r.natTable.Delete(clientKey)
-			}
-
 			if isSYN && r.config.Verbose {
 				log.Printf("[Divert-Forward] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d, captured IfIdx=%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort, addr.Network().InterfaceIndex)
@@ -341,17 +335,10 @@ func (r *Redirector) networkLoop() {
 		if r.subnet.Contains(srcIP) && !srcIP.Equal(r.listenIP) && r.isTargetPort(dstPort) {
 			clientKey := net.JoinHostPort(srcIP.String(), strconv.Itoa(int(srcPort)))
 			origDst := net.JoinHostPort(dstIP.String(), strconv.Itoa(int(dstPort)))
+			r.natTable.Set(clientKey, origDst)
 
 			tcpFlags := buf[ihl+13]
 			isSYN := (tcpFlags&0x02 != 0) && (tcpFlags&0x10 == 0)
-			isRST := (tcpFlags & 0x04) != 0
-
-			if isSYN {
-				r.natTable.Set(clientKey, origDst)
-			} else if isRST {
-				r.natTable.Delete(clientKey)
-			}
-
 			if isSYN && r.config.Verbose {
 				log.Printf("[Divert-Network] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort)

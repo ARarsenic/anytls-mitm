@@ -107,6 +107,10 @@ type Proxy struct {
 	connsPerIP    map[string]int
 	totalAccepted uint64
 	totalRejected uint64
+
+	// Handshake failure counter to distinguish cold-start AnyTLS timeouts from normal strict-cert websites
+	failMu            sync.Mutex
+	handshakeFailures map[string]int
 }
 
 // NewProxy creates and initializes a Proxy.
@@ -130,13 +134,14 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 	}
 
 	return &Proxy{
-		config:          cfg,
-		natTable:        cfg.NATTable,
-		whitelist:       NewWhitelistCache(cfg.WhitelistTTL),
-		confirmedAnyTLS: NewConfirmedAnyTLSCache(2000, 24*time.Hour),
-		certCloner:      cloner,
-		stopChan:        make(chan struct{}),
-		connsPerIP:      make(map[string]int),
+		config:            cfg,
+		natTable:          cfg.NATTable,
+		whitelist:         NewWhitelistCache(cfg.WhitelistTTL),
+		confirmedAnyTLS:   NewConfirmedAnyTLSCache(2000, 24*time.Hour),
+		certCloner:        cloner,
+		stopChan:          make(chan struct{}),
+		connsPerIP:        make(map[string]int),
+		handshakeFailures: make(map[string]int),
 	}, nil
 }
 
@@ -219,6 +224,10 @@ func (p *Proxy) Stop() {
 	p.whitelist.Clear()
 	p.confirmedAnyTLS.Clear()
 	p.certCloner.Clear()
+
+	p.failMu.Lock()
+	p.handshakeFailures = make(map[string]int)
+	p.failMu.Unlock()
 }
 
 func (p *Proxy) acceptLoop() {
@@ -262,11 +271,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	}
 	defer p.releaseConn(clientIP)
 
-	// H-03: Ensure clientConn is closed and NAT mapping is removed when connection finishes
-	defer func() {
-		clientConn.Close()
-		p.natTable.Delete(clientAddr)
-	}()
+	defer clientConn.Close()
 
 	// Look up original destination from NAT table (with retry loop)
 	var origDst string
@@ -432,15 +437,22 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				clientAddr, origDst, handshakeErr)
 		}
 		if !p.confirmedAnyTLS.Contains(origDst) {
-			if isClientCertRejection(handshakeErr) {
+			p.failMu.Lock()
+			p.handshakeFailures[origDst]++
+			fails := p.handshakeFailures[origDst]
+			p.failMu.Unlock()
+
+			// Fast fail-open for normal internet browsing:
+			// If client sends explicit TLS alert rejection, OR fails consecutive attempts (e.g. Chrome/Safari/iOS closing socket on untrusted cert)
+			if isClientCertRejection(handshakeErr) || fails >= 2 {
 				if p.config.Verbose {
-					log.Printf("[Stage2-FailOpen] Client rejected certificate (%v), adding %s to whitelist cache for fast bypass",
-						handshakeErr, origDst)
+					log.Printf("[Stage2-FailOpen] Adding %s to whitelist for fast bypass (failures=%d, err=%v)",
+						origDst, fails, handshakeErr)
 				}
 				p.whitelist.Add(origDst)
 			} else if p.config.Verbose {
-				log.Printf("[Stage2-FailOpen] Handshake error was network/reset (%v), NOT certificate rejection. Will NOT whitelist %s",
-					handshakeErr, origDst)
+				log.Printf("[Stage2-FailOpen] Handshake failed for %s (attempt %d, not whitelisting yet): %v",
+					origDst, fails, handshakeErr)
 			}
 		} else if p.config.Verbose {
 			log.Printf("[Stage2-FailOpen] Not whitelisting %s because it is a confirmed AnyTLS server", origDst)
@@ -454,6 +466,11 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}()
 		return
 	}
+
+	// On handshake success, reset failure count for this destination
+	p.failMu.Lock()
+	delete(p.handshakeFailures, origDst)
+	p.failMu.Unlock()
 
 	if p.config.Verbose {
 		log.Printf("[Stage2-Success] Downstream TLS handshake SUCCESS for %s -> %s! Client accepted cloned certificate.",
@@ -494,6 +511,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	if matched {
 		p.confirmedAnyTLS.Add(origDst)
 		p.whitelist.Remove(origDst)
+		p.failMu.Lock()
+		delete(p.handshakeFailures, origDst)
+		p.failMu.Unlock()
 		log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
 			clientAddr, origDst, sni, authHash)
 
