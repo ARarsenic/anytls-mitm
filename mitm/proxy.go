@@ -562,101 +562,26 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	p.relayTLS(downstreamTLS, uTLS, brDecrypted, clientAddr, origDst)
 }
 
-// copyChunked copies from src to dst in bounded chunks to prevent individual
-// encrypted TLS records and outbound IP packets from exceeding standard MTU (1500 bytes).
-func copyChunked(dst io.Writer, src io.Reader, maxChunk int) (int64, error) {
-	buf := make([]byte, maxChunk)
-	var written int64
-	for {
-		nr, er := src.Read(buf)
-		if nr > 0 {
-			nw, ew := dst.Write(buf[0:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if ew != nil {
-				return written, ew
-			}
-			if nr != nw {
-				return written, io.ErrShortWrite
-			}
-		}
-		if er != nil {
-			if er == io.EOF {
-				return written, nil
-			}
-			return written, er
-		}
-	}
-}
-
-func isIgnorableCloseErr(err error) bool {
-	if err == nil || err == io.EOF {
-		return true
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "use of closed network connection") ||
-		strings.Contains(s, "connection reset by peer") ||
-		strings.Contains(s, "forcibly closed") ||
-		strings.Contains(s, "broken pipe")
-}
-
 // relayTLS transparently bridges decrypted downstream and upstream TLS streams.
 func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *bufio.Reader, clientAddr, origDst string) {
-	// Enable TCP Keep-Alive and NoDelay if underlying sockets allow
-	if tcp, ok := uTLS.NetConn().(*net.TCPConn); ok {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcp.SetNoDelay(true)
-	}
-	if tcp, ok := downstreamTLS.NetConn().(*net.TCPConn); ok {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcp.SetNoDelay(true)
-	}
-
-	var (
-		c2uBytes int64
-		c2uErr   error
-		u2cBytes int64
-		u2cErr   error
-		wg       sync.WaitGroup
-	)
+	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Client -> Upstream
 	go func() {
 		defer wg.Done()
-		c2uBytes, c2uErr = copyChunked(uTLS, brDecrypted, 1350)
-		if c2uErr != nil && !isIgnorableCloseErr(c2uErr) {
-			_ = downstreamTLS.Close()
-			_ = uTLS.Close()
-			return
-		}
-		_ = uTLS.CloseWrite()
+		defer uTLS.Close()
+		defer downstreamTLS.Close()
+		_, _ = io.Copy(uTLS, brDecrypted)
 	}()
 
-	// Upstream -> Client: Chunk writes to 1350 bytes so each TLS record + IP header
-	// fits safely within standard Wi-Fi Hotspot MTU (1500 bytes)
 	go func() {
 		defer wg.Done()
-		u2cBytes, u2cErr = copyChunked(downstreamTLS, uTLS, 1350)
-		if u2cErr != nil && !isIgnorableCloseErr(u2cErr) {
-			_ = downstreamTLS.Close()
-			_ = uTLS.Close()
-			return
-		}
-		_ = downstreamTLS.CloseWrite()
+		defer downstreamTLS.Close()
+		defer uTLS.Close()
+		_, _ = io.Copy(downstreamTLS, uTLS)
 	}()
 
 	wg.Wait()
-	_ = uTLS.Close()
-	_ = downstreamTLS.Close()
-
-	if p.config.Verbose || (c2uErr != nil && !isIgnorableCloseErr(c2uErr)) || (u2cErr != nil && !isIgnorableCloseErr(u2cErr)) {
-		log.Printf("[Proxy-Relay] Stream ended for %s: Client->Upstream: %d bytes (err: %v) | Upstream->Client: %d bytes (err: %v)",
-			clientAddr, c2uBytes, c2uErr, u2cBytes, u2cErr)
-	}
 }
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.
@@ -670,17 +595,6 @@ func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io
 	}
 	defer upstreamConn.Close()
 
-	if tcp, ok := clientConn.(*net.TCPConn); ok {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcp.SetNoDelay(true)
-	}
-	if tcp, ok := upstreamConn.(*net.TCPConn); ok {
-		_ = tcp.SetKeepAlive(true)
-		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
-		_ = tcp.SetNoDelay(true)
-	}
-
 	var clientReader io.Reader = clientConn
 	if prefixReader != nil {
 		clientReader = prefixReader
@@ -691,41 +605,19 @@ func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io
 
 	go func() {
 		defer wg.Done()
-		_, err := copyChunked(upstreamConn, clientReader, 1400)
-		if p.config.Verbose && err != nil {
-			log.Printf("[Proxy-RawTCP] Client -> Upstream stream ended: %v", err)
-		}
-		if err != nil {
-			_ = clientConn.Close()
-			_ = upstreamConn.Close()
-			return
-		}
-		if tcp, ok := upstreamConn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
-		}
-		_ = upstreamConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		defer upstreamConn.Close()
+		defer clientConn.Close()
+		_, _ = io.Copy(upstreamConn, clientReader)
 	}()
 
 	go func() {
 		defer wg.Done()
-		_, err := copyChunked(clientConn, upstreamConn, 1400)
-		if p.config.Verbose && err != nil {
-			log.Printf("[Proxy-RawTCP] Upstream -> Client stream ended: %v", err)
-		}
-		if err != nil {
-			_ = clientConn.Close()
-			_ = upstreamConn.Close()
-			return
-		}
-		if tcp, ok := clientConn.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
-		}
-		_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		defer clientConn.Close()
+		defer upstreamConn.Close()
+		_, _ = io.Copy(clientConn, upstreamConn)
 	}()
 
 	wg.Wait()
-	_ = upstreamConn.Close()
-	_ = clientConn.Close()
 	if p.config.Verbose {
 		log.Printf("[Proxy-RawTCP] Connection closed: %s <-> %s", clientConn.RemoteAddr(), origDst)
 	}
