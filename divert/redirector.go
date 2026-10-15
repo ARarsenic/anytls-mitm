@@ -375,6 +375,11 @@ func (r *Redirector) networkLoop() {
 						addr.Flags |= 0x02 // Outbound
 						addr.Flags |= 0x08 // Impostor
 
+						if pktLen > 1500 && r.config.Verbose {
+							log.Printf("[Divert-Net] WARNING: Outbound packet to %s is %d bytes (> MTU 1500)! May be dropped by Wi-Fi driver.",
+								clientKey, pktLen)
+						}
+
 						tcpFlags := buf[ihl+13]
 						if tcpFlags&0x12 == 0x12 && r.config.Verbose {
 							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (from proxy port %d)",

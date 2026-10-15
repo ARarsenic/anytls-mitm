@@ -51,9 +51,10 @@ func (n *NATTable) Set(clientKey string, origDst string) {
 
 // Get looks up the original destination for a given ClientIP:ClientPort.
 // It verifies that the NAT mapping has not expired past the configured TTL (H-03 fix).
+// On hit, it refreshes UpdatedAt (sliding TTL) so active connections do not expire.
 func (n *NATTable) Get(clientKey string) (string, bool) {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	entry, ok := n.table[clientKey]
 	if !ok {
 		return "", false
@@ -61,6 +62,7 @@ func (n *NATTable) Get(clientKey string) (string, bool) {
 	if n.ttl > 0 && time.Since(entry.UpdatedAt) > n.ttl {
 		return "", false
 	}
+	entry.UpdatedAt = time.Now()
 	return entry.OriginalDst, true
 }
 
