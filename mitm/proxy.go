@@ -516,10 +516,10 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		p.loggedMu.Unlock()
 
 		if matched {
-			if shouldLogDetails {
-				log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
-					clientAddr, origDst, sni, authHash)
+			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
+				clientAddr, origDst, sni, authHash)
 
+			if shouldLogDetails {
 				var fpDetails []string
 				if clientFingerprint != nil {
 					fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
@@ -545,16 +545,14 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				if len(fpDetails) > 0 {
 					log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
 				}
-			} else if p.config.Verbose {
-				log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s (Multiplexed stream)",
-					clientAddr, origDst, sni)
 			}
-		} else if p.config.Verbose {
-			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s (Confirmed AnyTLS session)",
+		} else {
+			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s (Subsequent AnyTLS stream)",
 				clientAddr, origDst, sni)
 		}
-	} else {
-		// Decrypted stream did not match AnyTLS protocol (e.g. plaintext HTTP GET/POST/PRI from browser)
+	} else if origPort == 443 {
+		// ONLY whitelist port 443 (standard web browsing) when decrypted stream is plaintext HTTP!
+		// Non-443 proxy ports (e.g. 8443) MUST NEVER be whitelisted!
 		if !p.confirmedAnyTLS.Contains(origDst) {
 			p.whitelist.Add(origDst)
 			log.Printf("[WHITELIST-BYPASS] Host %s detected as standard web traffic (non-AnyTLS). Added to whitelist for direct Raw TCP bypass.", origDst)
@@ -642,25 +640,41 @@ func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io
 
 	go func() {
 		defer wg.Done()
-		defer upstreamConn.Close()
-		defer clientConn.Close()
-		n, err := io.Copy(upstreamConn, clientReader)
-		if p.config.Verbose {
-			log.Printf("[Proxy-RawTCP] Client -> Upstream stream ended: %d bytes, err: %v", n, err)
+		_, err := io.Copy(upstreamConn, clientReader)
+		if p.config.Verbose && err != nil {
+			log.Printf("[Proxy-RawTCP] Client -> Upstream stream ended: %v", err)
 		}
+		if err != nil {
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+			return
+		}
+		if tcp, ok := upstreamConn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		_ = upstreamConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}()
 
 	go func() {
 		defer wg.Done()
-		defer clientConn.Close()
-		defer upstreamConn.Close()
-		n, err := io.Copy(clientConn, upstreamConn)
-		if p.config.Verbose {
-			log.Printf("[Proxy-RawTCP] Upstream -> Client stream ended: %d bytes, err: %v", n, err)
+		_, err := io.Copy(clientConn, upstreamConn)
+		if p.config.Verbose && err != nil {
+			log.Printf("[Proxy-RawTCP] Upstream -> Client stream ended: %v", err)
 		}
+		if err != nil {
+			_ = clientConn.Close()
+			_ = upstreamConn.Close()
+			return
+		}
+		if tcp, ok := clientConn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
+		_ = clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	}()
 
 	wg.Wait()
+	_ = upstreamConn.Close()
+	_ = clientConn.Close()
 	if p.config.Verbose {
 		log.Printf("[Proxy-RawTCP] Connection closed: %s <-> %s", clientConn.RemoteAddr(), origDst)
 	}
