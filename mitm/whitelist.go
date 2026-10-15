@@ -8,16 +8,18 @@ import (
 // WhitelistCache is a thread-safe in-memory TTL cache for destinations that
 // require strict TLS certificate verification (i.e. fail-open bypass).
 type WhitelistCache struct {
-	mu      sync.RWMutex
-	entries map[string]time.Time
-	ttl     time.Duration
+	mu       sync.RWMutex
+	entries  map[string]time.Time
+	ttl      time.Duration
+	stopChan chan struct{}
 }
 
 // NewWhitelistCache creates a new WhitelistCache with the given TTL.
 func NewWhitelistCache(ttl time.Duration) *WhitelistCache {
 	c := &WhitelistCache{
-		entries: make(map[string]time.Time),
-		ttl:     ttl,
+		entries:  make(map[string]time.Time),
+		ttl:      ttl,
+		stopChan: make(chan struct{}),
 	}
 	go c.cleanupLoop()
 	return c
@@ -58,18 +60,40 @@ func (c *WhitelistCache) Remove(addr string) {
 	delete(c.entries, addr)
 }
 
+// Clear flushes all entries from the whitelist.
+func (c *WhitelistCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]time.Time)
+}
+
+// Stop cleanly terminates the background cleanup goroutine.
+func (c *WhitelistCache) Stop() {
+	select {
+	case <-c.stopChan:
+		return
+	default:
+		close(c.stopChan)
+	}
+}
+
 // cleanupLoop periodically sweeps and removes expired entries.
 func (c *WhitelistCache) cleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	for now := range ticker.C {
-		c.mu.Lock()
-		for addr, addedAt := range c.entries {
-			if now.Sub(addedAt) > c.ttl {
-				delete(c.entries, addr)
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case now := <-ticker.C:
+			c.mu.Lock()
+			for addr, addedAt := range c.entries {
+				if now.Sub(addedAt) > c.ttl {
+					delete(c.entries, addr)
+				}
 			}
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 	}
 }

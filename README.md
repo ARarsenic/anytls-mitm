@@ -189,6 +189,9 @@ go build -o anytls-mitm.exe .
 | `-listen-port` | `10443` | 本地 TCP 代理监听端口 |
 | `-ports` | `1-65535` | 需要拦截的目标服务器端口，支持范围如 `1-65535`、`8000-9000` 或逗号分隔列表 `8443,443` |
 | `-whitelist-ttl` | `30` | Fail-Open 白名单失效时间（分钟，0 表示关闭白名单缓存） |
+| `-max-conns` | `2048` | 全局最大并发 TCP 连接数（防慢速连接耗尽 / DoS） |
+| `-handshake-timeout` | `10` | TLS 握手及 ClientHello 读取超时时间（秒，防 Slowloris 攻击） |
+| `-inspect-timeout` | `5` | AnyTLS 首包无损探测读取超时时间（秒） |
 | `-verbose` | `false` | 启用详细连接跟踪与调试日志（默认关闭，保持界面清爽） |
 | `-no-divert` | `false` | 仅启动 TCP MITM 代理服务，不加载 WinDivert 驱动（测试调试用） |
 

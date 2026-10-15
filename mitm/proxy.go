@@ -17,22 +17,96 @@ import (
 
 // ProxyConfig holds parameters for the MITM proxy listener.
 type ProxyConfig struct {
-	ListenIP     string
-	ListenPort   uint16
-	NATTable     *divert.NATTable
-	WhitelistTTL time.Duration
-	Verbose      bool
+	ListenIP         string
+	ListenPort       uint16
+	NATTable         *divert.NATTable
+	WhitelistTTL     time.Duration
+	Verbose          bool
+	MaxConns         int           // Maximum total concurrent connections (H-01)
+	MaxConnsPerIP    int           // Maximum concurrent connections per client IP (H-01)
+	HandshakeTimeout time.Duration // Timeout for ClientHello peek and downstream TLS handshake (H-01)
+	InspectTimeout   time.Duration // Timeout for AnyTLS first-packet detection (H-01)
+}
+
+// ConfirmedAnyTLSCache provides a bounded, TTL-aware cache for confirmed AnyTLS server destinations (H-02 fix).
+type ConfirmedAnyTLSCache struct {
+	mu         sync.RWMutex
+	entries    map[string]time.Time
+	maxEntries int
+	ttl        time.Duration
+}
+
+// NewConfirmedAnyTLSCache initializes a bounded, TTL-aware ConfirmedAnyTLSCache.
+func NewConfirmedAnyTLSCache(maxEntries int, ttl time.Duration) *ConfirmedAnyTLSCache {
+	if maxEntries <= 0 {
+		maxEntries = 2000
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	return &ConfirmedAnyTLSCache{
+		entries:    make(map[string]time.Time),
+		maxEntries: maxEntries,
+		ttl:        ttl,
+	}
+}
+
+// Add records an address as a confirmed AnyTLS server with current timestamp.
+func (c *ConfirmedAnyTLSCache) Add(origDst string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	if len(c.entries) >= c.maxEntries {
+		for k, t := range c.entries {
+			if now.Sub(t) > c.ttl {
+				delete(c.entries, k)
+			}
+		}
+		if len(c.entries) >= c.maxEntries {
+			for k := range c.entries {
+				delete(c.entries, k)
+				break
+			}
+		}
+	}
+	c.entries[origDst] = now
+}
+
+// Contains checks if the address was confirmed as AnyTLS within the TTL window.
+func (c *ConfirmedAnyTLSCache) Contains(origDst string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.entries[origDst]
+	if !ok {
+		return false
+	}
+	return time.Since(t) <= c.ttl
+}
+
+// Clear flushes all entries from the cache.
+func (c *ConfirmedAnyTLSCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]time.Time)
 }
 
 // Proxy implements the 3-stage MITM pipeline for intercepted hotspot traffic.
 type Proxy struct {
-	config     ProxyConfig
-	listener   net.Listener
-	natTable   *divert.NATTable
+	config          ProxyConfig
+	listener        net.Listener
+	natTable        *divert.NATTable
 	whitelist       *WhitelistCache
-	confirmedAnyTLS sync.Map
+	confirmedAnyTLS *ConfirmedAnyTLSCache
 	certCloner      *CertCloner
 	stopChan        chan struct{}
+
+	// Concurrency & DoS tracking (H-01 fix)
+	connMu        sync.Mutex
+	activeConns   int
+	connsPerIP    map[string]int
+	totalAccepted uint64
+	totalRejected uint64
 }
 
 // NewProxy creates and initializes a Proxy.
@@ -42,13 +116,70 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		return nil, fmt.Errorf("failed to create certificate cloner: %w", err)
 	}
 
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = 2048
+	}
+	if cfg.MaxConnsPerIP <= 0 {
+		cfg.MaxConnsPerIP = 128
+	}
+	if cfg.HandshakeTimeout <= 0 {
+		cfg.HandshakeTimeout = 10 * time.Second
+	}
+	if cfg.InspectTimeout <= 0 {
+		cfg.InspectTimeout = 5 * time.Second
+	}
+
 	return &Proxy{
-		config:     cfg,
-		natTable:   cfg.NATTable,
-		whitelist:  NewWhitelistCache(cfg.WhitelistTTL),
-		certCloner: cloner,
-		stopChan:   make(chan struct{}),
+		config:          cfg,
+		natTable:        cfg.NATTable,
+		whitelist:       NewWhitelistCache(cfg.WhitelistTTL),
+		confirmedAnyTLS: NewConfirmedAnyTLSCache(2000, 24*time.Hour),
+		certCloner:      cloner,
+		stopChan:        make(chan struct{}),
+		connsPerIP:      make(map[string]int),
 	}, nil
+}
+
+// acquireConn attempts to register a new connection, enforcing total and per-IP limits (H-01).
+func (p *Proxy) acquireConn(clientIP string) bool {
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+
+	if p.config.MaxConns > 0 && p.activeConns >= p.config.MaxConns {
+		p.totalRejected++
+		return false
+	}
+	if p.config.MaxConnsPerIP > 0 && p.connsPerIP[clientIP] >= p.config.MaxConnsPerIP {
+		p.totalRejected++
+		return false
+	}
+
+	p.activeConns++
+	p.connsPerIP[clientIP]++
+	p.totalAccepted++
+	return true
+}
+
+// releaseConn decrements the active connection counts when a connection closes (H-01).
+func (p *Proxy) releaseConn(clientIP string) {
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+
+	p.activeConns--
+	if p.activeConns < 0 {
+		p.activeConns = 0
+	}
+	p.connsPerIP[clientIP]--
+	if p.connsPerIP[clientIP] <= 0 {
+		delete(p.connsPerIP, clientIP)
+	}
+}
+
+// Stats returns connection metrics (H-01).
+func (p *Proxy) Stats() (active int, accepted uint64, rejected uint64) {
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+	return p.activeConns, p.totalAccepted, p.totalRejected
 }
 
 // Start begins listening on the configured address and handles incoming connections.
@@ -71,7 +202,7 @@ func (p *Proxy) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop closes the TCP listener.
+// Stop closes the TCP listener and terminates/cleans up background caches (H-02).
 func (p *Proxy) Stop() {
 	select {
 	case <-p.stopChan:
@@ -83,6 +214,11 @@ func (p *Proxy) Stop() {
 	if p.listener != nil {
 		p.listener.Close()
 	}
+
+	p.whitelist.Stop()
+	p.whitelist.Clear()
+	p.confirmedAnyTLS.Clear()
+	p.certCloner.Clear()
 }
 
 func (p *Proxy) acceptLoop() {
@@ -113,9 +249,24 @@ func (c *bufferedConn) Read(b []byte) (int, error) {
 }
 
 func (p *Proxy) handleConnection(clientConn net.Conn) {
-	defer clientConn.Close()
-
 	clientAddr := clientConn.RemoteAddr().String()
+	clientIP, _, _ := net.SplitHostPort(clientAddr)
+
+	// H-01: Enforce maximum concurrency and per-client IP limits against Slowloris / DoS
+	if !p.acquireConn(clientIP) {
+		if p.config.Verbose {
+			log.Printf("[Proxy-DoS] Connection rejected from %s: max concurrency limit reached", clientAddr)
+		}
+		clientConn.Close()
+		return
+	}
+	defer p.releaseConn(clientIP)
+
+	// H-03: Ensure clientConn is closed and NAT mapping is removed when connection finishes
+	defer func() {
+		clientConn.Close()
+		p.natTable.Delete(clientAddr)
+	}()
 
 	// Look up original destination from NAT table (with retry loop)
 	var origDst string
@@ -146,11 +297,14 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			log.Printf("[Stage1-Whitelist-Bypass] Client: %s -> Server: %s (Destination is in fail-open whitelist, splicing raw TCP)",
 				clientAddr, origDst)
 		}
+		_ = clientConn.SetDeadline(time.Time{})
 		p.relayRawTCP(clientConn, origDst, nil)
 		return
 	}
 
-	// Check if initial bytes match a TLS ClientHello Record (0x16)
+	// H-01: Set read deadline for initial ClientHello record peek
+	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.HandshakeTimeout))
+
 	brClient := bufio.NewReader(clientConn)
 	headerBytes, err := brClient.Peek(5)
 	if err != nil {
@@ -165,6 +319,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			log.Printf("[Stage1-PreCheck] Non-TLS record header 0x%02x from %s, bypassing MITM via raw TCP to %s",
 				headerBytes[0], clientAddr, origDst)
 		}
+		_ = clientConn.SetDeadline(time.Time{})
 		p.relayRawTCP(clientConn, origDst, brClient)
 		return
 	}
@@ -265,6 +420,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		},
 	}
 
+	// H-01: Set read deadline for downstream TLS handshake
+	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.HandshakeTimeout))
+
 	downstreamTLS := tls.Server(wrappedClientConn, serverTLSConfig)
 	handshakeErr := downstreamTLS.Handshake()
 	if handshakeErr != nil {
@@ -273,7 +431,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			log.Printf("[Stage2-FailOpen] Downstream TLS handshake failed for %s -> %s: %v",
 				clientAddr, origDst, handshakeErr)
 		}
-		if _, isAnyTLS := p.confirmedAnyTLS.Load(origDst); !isAnyTLS {
+		if !p.confirmedAnyTLS.Contains(origDst) {
 			if isClientCertRejection(handshakeErr) {
 				if p.config.Verbose {
 					log.Printf("[Stage2-FailOpen] Client rejected certificate (%v), adding %s to whitelist cache for fast bypass",
@@ -323,6 +481,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	// -------------------------------------------------------------
 	// Stage 3: First-Packet AnyTLS Identification & Transparent Relay
 	// -------------------------------------------------------------
+	// H-01: Set read deadline for first-packet inspection against Slowloris
+	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.InspectTimeout))
+
 	brDecrypted := bufio.NewReaderSize(downstreamTLS, 65536)
 	matched, authHash, meta, err := InspectAnyTLS(brDecrypted)
 	if err != nil && p.config.Verbose {
@@ -331,7 +492,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	}
 
 	if matched {
-		p.confirmedAnyTLS.Store(origDst, true)
+		p.confirmedAnyTLS.Add(origDst)
 		p.whitelist.Remove(origDst)
 		log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
 			clientAddr, origDst, sni, authHash)
@@ -359,25 +520,26 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		if meta != nil && meta.PaddingMD5 != "" {
 			fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
 		}
-
 		if len(fpDetails) > 0 {
 			log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
 		}
-	} else {
-		log.Printf("[NON-ANYTLS-MITM] Client: %s -> Server: %s | Decrypted first packet did not match AnyTLS protocol (forwarding transparently)",
-			clientAddr, origDst)
 	}
 
-	if p.config.Verbose {
-		downstreamState := downstreamTLS.ConnectionState()
-		upstreamState := uTLS.ConnectionState()
-		log.Printf("[Proxy-Relay] TLS Established | Downstream: ALPN=%q, Version=0x%04x, Cipher=0x%04x | Upstream: ALPN=%q, Version=0x%04x, Cipher=0x%04x | BufferedBytes=%d",
-			downstreamState.NegotiatedProtocol, downstreamState.Version, downstreamState.CipherSuite,
-			upstreamState.NegotiatedProtocol, upstreamState.Version, upstreamState.CipherSuite,
-			brDecrypted.Buffered())
+	// H-01: Clear deadlines before entering transparent stream relay
+	_ = clientConn.SetDeadline(time.Time{})
+	_ = uTLS.SetDeadline(time.Time{})
+
+	p.relayTLS(downstreamTLS, uTLS, brDecrypted, clientAddr, origDst)
+}
+
+// relayTLS transparently bridges decrypted downstream and upstream TLS streams.
+func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *bufio.Reader, clientAddr, origDst string) {
+	// Enable TCP Keep-Alive if underlying sockets allow
+	if tcp, ok := uTLS.NetConn().(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	// Transparently bridge the two decrypted TLS streams
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -409,6 +571,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.
 func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io.Reader) {
+	_ = clientConn.SetDeadline(time.Time{})
+
 	upstreamConn, err := net.DialTimeout("tcp", origDst, 5*time.Second)
 	if err != nil {
 		if p.config.Verbose {
@@ -417,6 +581,15 @@ func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io
 		return
 	}
 	defer upstreamConn.Close()
+
+	if tcp, ok := clientConn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+	}
+	if tcp, ok := upstreamConn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	var clientReader io.Reader = clientConn
 	if prefixReader != nil {
@@ -472,4 +645,3 @@ func isClientCertRejection(err error) bool {
 	}
 	return false
 }
-

@@ -14,16 +14,28 @@ type NATEntry struct {
 // NATTable is a thread-safe in-memory mapping table of
 // ClientIPPort -> OriginalDstIPPort.
 type NATTable struct {
-	mu    sync.RWMutex
-	table map[string]*NATEntry
+	mu       sync.RWMutex
+	table    map[string]*NATEntry
+	ttl      time.Duration
+	stopChan chan struct{}
 }
 
-// NewNATTable creates a new initialized NATTable.
+// NewNATTable creates a new initialized NATTable with a default TTL.
 func NewNATTable() *NATTable {
-	nt := &NATTable{
-		table: make(map[string]*NATEntry),
+	return NewNATTableWithTTL(3 * time.Minute)
+}
+
+// NewNATTableWithTTL creates a new NATTable with the specified TTL.
+func NewNATTableWithTTL(ttl time.Duration) *NATTable {
+	if ttl <= 0 {
+		ttl = 3 * time.Minute
 	}
-	go nt.cleanupLoop(10 * time.Minute)
+	nt := &NATTable{
+		table:    make(map[string]*NATEntry),
+		ttl:      ttl,
+		stopChan: make(chan struct{}),
+	}
+	go nt.cleanupLoop()
 	return nt
 }
 
@@ -38,11 +50,15 @@ func (n *NATTable) Set(clientKey string, origDst string) {
 }
 
 // Get looks up the original destination for a given ClientIP:ClientPort.
+// It verifies that the NAT mapping has not expired past the configured TTL (H-03 fix).
 func (n *NATTable) Get(clientKey string) (string, bool) {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	entry, ok := n.table[clientKey]
 	if !ok {
+		return "", false
+	}
+	if n.ttl > 0 && time.Since(entry.UpdatedAt) > n.ttl {
 		return "", false
 	}
 	return entry.OriginalDst, true
@@ -62,18 +78,33 @@ func (n *NATTable) Len() int {
 	return len(n.table)
 }
 
+// Stop terminates the background cleanup goroutine.
+func (n *NATTable) Stop() {
+	select {
+	case <-n.stopChan:
+		return
+	default:
+		close(n.stopChan)
+	}
+}
+
 // cleanupLoop periodically removes NAT entries older than ttl to prevent memory growth.
-func (n *NATTable) cleanupLoop(ttl time.Duration) {
-	ticker := time.NewTicker(2 * time.Minute)
+func (n *NATTable) cleanupLoop() {
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for now := range ticker.C {
-		n.mu.Lock()
-		for key, entry := range n.table {
-			if now.Sub(entry.UpdatedAt) > ttl {
-				delete(n.table, key)
+	for {
+		select {
+		case <-n.stopChan:
+			return
+		case now := <-ticker.C:
+			n.mu.Lock()
+			for key, entry := range n.table {
+				if now.Sub(entry.UpdatedAt) > n.ttl {
+					delete(n.table, key)
+				}
 			}
+			n.mu.Unlock()
 		}
-		n.mu.Unlock()
 	}
 }

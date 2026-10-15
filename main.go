@@ -70,9 +70,12 @@ func main() {
 		listenIP     string
 		listenPort   int
 		portsStr     string
-		whitelistTTL int
-		noDivert     bool
-		verbose      bool
+		whitelistTTL     int
+		maxConns         int
+		handshakeTimeout int
+		inspectTimeout   int
+		noDivert         bool
+		verbose          bool
 	)
 
 	flag.StringVar(&subnetStr, "subnet", "192.168.137.0/24", "Windows Hotspot subnet CIDR")
@@ -80,6 +83,9 @@ func main() {
 	flag.IntVar(&listenPort, "listen-port", 10443, "Local TCP proxy listen port")
 	flag.StringVar(&portsStr, "ports", "1-65535", "Target destination TCP ports or ranges to intercept (default 1-65535 for all ports, e.g. 1-65535, or 8443,443)")
 	flag.IntVar(&whitelistTTL, "whitelist-ttl", 30, "Fail-open whitelist TTL in minutes for non-AnyTLS/strict-cert hosts")
+	flag.IntVar(&maxConns, "max-conns", 2048, "Maximum concurrent TCP connections (DoS/Slowloris defense)")
+	flag.IntVar(&handshakeTimeout, "handshake-timeout", 10, "TLS handshake timeout in seconds (Slowloris defense)")
+	flag.IntVar(&inspectTimeout, "inspect-timeout", 5, "First-packet AnyTLS detection timeout in seconds")
 	flag.BoolVar(&noDivert, "no-divert", false, "Run TCP proxy only without WinDivert packet redirection (for testing)")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose detailed connection and stream debug logging")
 	flag.Parse()
@@ -116,16 +122,21 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	// Shared thread-safe NAT table
+	// Shared thread-safe NAT table (with TTL expiration & clean shutdown)
 	natTable := divert.NewNATTable()
+	defer natTable.Stop()
 
 	// 1. Initialize & Start MITM Proxy
 	proxyCfg := mitm.ProxyConfig{
-		ListenIP:     listenIP,
-		ListenPort:   uint16(listenPort),
-		NATTable:     natTable,
-		WhitelistTTL: time.Duration(whitelistTTL) * time.Minute,
-		Verbose:      verbose,
+		ListenIP:         listenIP,
+		ListenPort:       uint16(listenPort),
+		NATTable:         natTable,
+		WhitelistTTL:     time.Duration(whitelistTTL) * time.Minute,
+		Verbose:          verbose,
+		MaxConns:         maxConns,
+		MaxConnsPerIP:    128,
+		HandshakeTimeout: time.Duration(handshakeTimeout) * time.Second,
+		InspectTimeout:   time.Duration(inspectTimeout) * time.Second,
 	}
 
 	mitmProxy, err := mitm.NewProxy(proxyCfg)
