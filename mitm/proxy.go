@@ -570,44 +570,35 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 	}
 
-	var wg sync.WaitGroup
+	var (
+		c2uBytes int64
+		c2uErr   error
+		u2cBytes int64
+		u2cErr   error
+		wg       sync.WaitGroup
+	)
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		c2uBytes, c2uErr := io.Copy(uTLS, brDecrypted)
-		if p.config.Verbose {
-			log.Printf("[Proxy-Relay] Client -> Upstream stream ended: copied %d bytes, err: %v", c2uBytes, c2uErr)
-		}
-		if c2uErr != nil {
-			_ = downstreamTLS.Close()
-			_ = uTLS.Close()
-			return
-		}
-		// Graceful EOF from client: give upstream server time to finish transmitting response
-		_ = uTLS.SetReadDeadline(time.Now().Add(30 * time.Second))
+		c2uBytes, c2uErr = io.Copy(uTLS, brDecrypted)
+		_ = downstreamTLS.Close()
+		_ = uTLS.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		u2cBytes, u2cErr := io.Copy(downstreamTLS, uTLS)
-		if p.config.Verbose {
-			log.Printf("[Proxy-Relay] Upstream -> Client stream ended: copied %d bytes, err: %v", u2cBytes, u2cErr)
-		}
-		if u2cErr != nil {
-			_ = downstreamTLS.Close()
-			_ = uTLS.Close()
-			return
-		}
-		_ = downstreamTLS.SetReadDeadline(time.Now().Add(5 * time.Second))
+		u2cBytes, u2cErr = io.Copy(downstreamTLS, uTLS)
+		_ = downstreamTLS.Close()
+		_ = uTLS.Close()
 	}()
 
 	wg.Wait()
 	_ = uTLS.Close()
 	_ = downstreamTLS.Close()
-	if p.config.Verbose {
-		log.Printf("[Proxy] Connection closed: %s <-> %s", clientAddr, origDst)
-	}
+
+	log.Printf("[Proxy-Relay] Stream ended for %s: Client->Upstream: %d bytes (err: %v) | Upstream->Client: %d bytes (err: %v)",
+		clientAddr, c2uBytes, c2uErr, u2cBytes, u2cErr)
 }
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.
