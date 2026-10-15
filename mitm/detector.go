@@ -80,13 +80,17 @@ func InspectAnyTLS(br *bufio.Reader) (bool, []byte, *AnyTLSMetadata, error) {
 	dataLen := int(binary.BigEndian.Uint16(fullBuf[offset+5 : offset+7]))
 
 	// Step 5: Check match condition
-	// In anytls, the first frame is always:
-	// - cmdSettings (cmd == 4 && streamID == 0)
-	// - cmdWaste (cmd == 0 && streamID == 0)
-	// - cmdSYN (cmd == 1)
+	// In AnyTLS, the initial frame commands defined by anytls protocol are:
+	// - CmdSettings (4, streamID == 0)
+	// - CmdWaste (0, streamID == 0)
+	// - CmdPing (5, streamID == 0)
+	// - CmdPong (6, streamID == 0)
+	// - CmdSYN (1)
 	isAnyTLS := false
 	if (cmd == CmdSettings && streamID == 0) ||
 		(cmd == CmdWaste && streamID == 0) ||
+		(cmd == CmdPing && streamID == 0) ||
+		(cmd == CmdPong && streamID == 0) ||
 		(cmd == CmdSYN) {
 		isAnyTLS = true
 	}

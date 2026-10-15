@@ -79,6 +79,20 @@ func TestInspectAnyTLSFirstPacket_ValidCases(t *testing.T) {
 			cmd:        CmdSettings,
 			streamID:   0,
 		},
+		{
+			name:       "Ping frame with 32 bytes padding",
+			password:   "pingProbePass",
+			paddingLen: 32,
+			cmd:        CmdPing,
+			streamID:   0,
+		},
+		{
+			name:       "Pong frame with zero padding",
+			password:   "pongProbePass",
+			paddingLen: 0,
+			cmd:        CmdPong,
+			streamID:   0,
+		},
 	}
 
 	for _, tc := range testCases {

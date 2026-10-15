@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -107,10 +108,6 @@ type Proxy struct {
 	connsPerIP    map[string]int
 	totalAccepted uint64
 	totalRejected uint64
-
-	// Handshake failure counter to distinguish cold-start AnyTLS timeouts from normal strict-cert websites
-	failMu            sync.Mutex
-	handshakeFailures map[string]int
 }
 
 // NewProxy creates and initializes a Proxy.
@@ -127,21 +124,20 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		cfg.MaxConnsPerIP = 128
 	}
 	if cfg.HandshakeTimeout <= 0 {
-		cfg.HandshakeTimeout = 10 * time.Second
+		cfg.HandshakeTimeout = 20 * time.Second
 	}
 	if cfg.InspectTimeout <= 0 {
-		cfg.InspectTimeout = 15 * time.Second
+		cfg.InspectTimeout = 30 * time.Second
 	}
 
 	return &Proxy{
-		config:            cfg,
-		natTable:          cfg.NATTable,
-		whitelist:         NewWhitelistCache(cfg.WhitelistTTL),
-		confirmedAnyTLS:   NewConfirmedAnyTLSCache(2000, 24*time.Hour),
-		certCloner:        cloner,
-		stopChan:          make(chan struct{}),
-		connsPerIP:        make(map[string]int),
-		handshakeFailures: make(map[string]int),
+		config:          cfg,
+		natTable:        cfg.NATTable,
+		whitelist:       NewWhitelistCache(cfg.WhitelistTTL),
+		confirmedAnyTLS: NewConfirmedAnyTLSCache(2000, 24*time.Hour),
+		certCloner:      cloner,
+		stopChan:        make(chan struct{}),
+		connsPerIP:      make(map[string]int),
 	}, nil
 }
 
@@ -224,10 +220,6 @@ func (p *Proxy) Stop() {
 	p.whitelist.Clear()
 	p.confirmedAnyTLS.Clear()
 	p.certCloner.Clear()
-
-	p.failMu.Lock()
-	p.handshakeFailures = make(map[string]int)
-	p.failMu.Unlock()
 }
 
 func (p *Proxy) acceptLoop() {
@@ -275,7 +267,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 	// Look up original destination from NAT table (with retry loop)
 	var origDst string
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 15; i++ {
 		if val, found := p.natTable.Get(clientAddr); found {
 			origDst = val
 			break
@@ -294,12 +286,20 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		log.Printf("[Proxy] Accepted TCP connection: %s -> %s", clientAddr, origDst)
 	}
 
+	// Extract original destination port to avoid accidental whitelisting of proxy ports
+	_, portStr, _ := net.SplitHostPort(origDst)
+	origPort, _ := strconv.Atoi(portStr)
+
 	// -------------------------------------------------------------
-	// Stage 1: Fail-Open Whitelist & Pre-Handshake Check
+	// Stage 1: AnyTLS Confirmation & Fail-Open Whitelist Check
 	// -------------------------------------------------------------
-	if p.whitelist.Contains(origDst) {
+	// Priority 1: If already confirmed as AnyTLS, NEVER whitelist or bypass it!
+	if p.confirmedAnyTLS.Contains(origDst) {
+		p.whitelist.Remove(origDst)
+	} else if p.whitelist.Contains(origDst) {
+		// Strictly verified standard web PKI host (e.g. apple.com:443), bypass via raw TCP
 		if p.config.Verbose {
-			log.Printf("[Stage1-Whitelist-Bypass] Client: %s -> Server: %s (Destination is in fail-open whitelist, splicing raw TCP)",
+			log.Printf("[Stage1-Whitelist-Bypass] Client: %s -> Server: %s (Destination in fail-open whitelist, splicing raw TCP)",
 				clientAddr, origDst)
 		}
 		_ = clientConn.SetDeadline(time.Time{})
@@ -307,7 +307,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	// H-01: Set read deadline for initial ClientHello record peek
+	// Peeking initial ClientHello record header (0x16)
 	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.HandshakeTimeout))
 
 	brClient := bufio.NewReader(clientConn)
@@ -350,7 +350,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		dialOnce.Do(func() {
 			go func() {
 				defer close(upstreamDone)
-				dialer := &net.Dialer{Timeout: 5 * time.Second}
+				dialer := &net.Dialer{Timeout: 15 * time.Second}
 				u, err := tls.DialWithDialer(dialer, "tcp", origDst, &tls.Config{
 					ServerName:         serverName,
 					InsecureSkipVerify: true,
@@ -371,11 +371,15 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			clientFingerprint = AnalyzeTLSFingerprint(hello)
 
 			// Fast Path: If certificate is already cloned and cached, return it immediately!
-			if cachedCert := p.certCloner.Get(origDst); cachedCert != nil {
+			if cachedCert, cachedProto := p.certCloner.GetWithALPN(origDst); cachedCert != nil {
 				startDialUpstream(sni, hello.SupportedProtos)
-				return &tls.Config{
+				cfg := &tls.Config{
 					Certificates: []tls.Certificate{*cachedCert},
-				}, nil
+				}
+				if cachedProto != "" {
+					cfg.NextProtos = []string{cachedProto}
+				}
+				return cfg, nil
 			}
 
 			// Slow Path (first connection only): Dial upstream synchronously to fetch & clone cert
@@ -406,7 +410,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 					peerCert.Subject, peerCert.Issuer, peerCert.DNSNames)
 			}
 
-			clonedCert, err := p.certCloner.Clone(peerCert, origDst, sni)
+			clonedCert, err := p.certCloner.Clone(peerCert, origDst, sni, state.NegotiatedProtocol)
 			if err != nil {
 				if p.config.Verbose {
 					log.Printf("[Stage2-Cloning] Certificate cloning failed: %v", err)
@@ -425,43 +429,29 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		},
 	}
 
-	wasCached := (p.certCloner.Get(origDst) != nil)
-
-	// H-01: Set read deadline for downstream TLS handshake
+	// Downstream TLS handshake
 	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.HandshakeTimeout))
 
 	downstreamTLS := tls.Server(wrappedClientConn, serverTLSConfig)
 	handshakeErr := downstreamTLS.Handshake()
 	if handshakeErr != nil {
-		// Handshake failed (e.g. client strict verification rejected cloned cert)
 		if p.config.Verbose {
 			log.Printf("[Stage2-FailOpen] Downstream TLS handshake failed for %s -> %s: %v",
 				clientAddr, origDst, handshakeErr)
 		}
-		if !p.confirmedAnyTLS.Contains(origDst) {
-			p.failMu.Lock()
-			if wasCached {
-				p.handshakeFailures[origDst]++
-			}
-			fails := p.handshakeFailures[origDst]
-			p.failMu.Unlock()
 
-			// Fast fail-open for normal internet browsing:
-			// ONLY whitelist if client sent an explicit TLS alert rejection,
-			// OR if the cert was ALREADY cached (served with 0ms delay) and still failed 2+ consecutive times.
-			// Cold-start connections (wasCached == false) will NEVER whitelist, ensuring AnyTLS is not bypassed!
-			if isClientCertRejection(handshakeErr) || (wasCached && fails >= 2) {
-				if p.config.Verbose {
-					log.Printf("[Stage2-FailOpen] Adding %s to whitelist for fast bypass (failures=%d, wasCached=%v, err=%v)",
-						origDst, fails, wasCached, handshakeErr)
-				}
-				p.whitelist.Add(origDst)
-			} else if p.config.Verbose {
-				log.Printf("[Stage2-FailOpen] Handshake failed for %s (attempt %d, wasCached=%v, not whitelisting yet): %v",
-					origDst, fails, wasCached, handshakeErr)
+		// Fail-open for standard web browsing:
+		// ONLY whitelist if:
+		// 1. Destination is NOT already a confirmed AnyTLS server, AND
+		// 2. Client sent an explicit TLS alert rejecting certificate (e.g. unknown CA, bad cert), AND
+		// 3. Port is 443 (standard web) or verified strict PKI rejection
+		// Network timeouts, client socket resets, and EOF are NEVER certificate rejections and will NOT whitelist!
+		if !p.confirmedAnyTLS.Contains(origDst) && isClientCertRejection(handshakeErr) {
+			if p.config.Verbose || origPort == 443 {
+				log.Printf("[Stage2-FailOpen] Client rejected certificate with TLS alert (%v). Adding %s to whitelist for fail-open browsing",
+					handshakeErr, origDst)
 			}
-		} else if p.config.Verbose {
-			log.Printf("[Stage2-FailOpen] Not whitelisting %s because it is a confirmed AnyTLS server", origDst)
+			p.whitelist.Add(origDst)
 		}
 
 		go func() {
@@ -472,11 +462,6 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}()
 		return
 	}
-
-	// On handshake success, reset failure count for this destination
-	p.failMu.Lock()
-	delete(p.handshakeFailures, origDst)
-	p.failMu.Unlock()
 
 	if p.config.Verbose {
 		log.Printf("[Stage2-Success] Downstream TLS handshake SUCCESS for %s -> %s! Client accepted cloned certificate.",
@@ -498,58 +483,57 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	defer uTLS.Close()
 
 	// -------------------------------------------------------------
-	// Stage 3: First-Packet AnyTLS Identification & Transparent Relay
+	// Stage 3: AnyTLS Identification & Transparent Relay
 	// -------------------------------------------------------------
-	// H-01: Set read deadline for first-packet inspection against Slowloris
-	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.InspectTimeout))
+	// Clear deadlines: do NOT impose rigid timeouts that kill idle proxy connection pools
+	_ = clientConn.SetDeadline(time.Time{})
+	_ = uTLS.SetDeadline(time.Time{})
 
 	brDecrypted := bufio.NewReaderSize(downstreamTLS, 65536)
 	matched, authHash, meta, err := InspectAnyTLS(brDecrypted)
 	if err != nil && p.config.Verbose {
-		log.Printf("[Stage3-Inspect] Read error during first packet inspection for %s -> %s: %v",
+		log.Printf("[Stage3-Inspect] Note on inspection for %s -> %s: %v",
 			clientAddr, origDst, err)
 	}
 
-	if matched {
+	if matched || p.confirmedAnyTLS.Contains(origDst) {
 		p.confirmedAnyTLS.Add(origDst)
 		p.whitelist.Remove(origDst)
-		p.failMu.Lock()
-		delete(p.handshakeFailures, origDst)
-		p.failMu.Unlock()
-		log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
-			clientAddr, origDst, sni, authHash)
 
-		// Display Client Fingerprint & Session Metadata info
-		var fpDetails []string
-		if clientFingerprint != nil {
-			fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
-			if clientFingerprint.HasGREASE {
-				fpDetails = append(fpDetails, "GREASE=True")
+		if matched {
+			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
+				clientAddr, origDst, sni, authHash)
+
+			var fpDetails []string
+			if clientFingerprint != nil {
+				fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
+				if clientFingerprint.HasGREASE {
+					fpDetails = append(fpDetails, "GREASE=True")
+				}
+				if len(clientFingerprint.ALPN) > 0 {
+					fpDetails = append(fpDetails, fmt.Sprintf("ALPN=%v", clientFingerprint.ALPN))
+				}
+				if clientFingerprint.JA3Hash != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("JA3=%s", clientFingerprint.JA3Hash))
+				}
 			}
-			if len(clientFingerprint.ALPN) > 0 {
-				fpDetails = append(fpDetails, fmt.Sprintf("ALPN=%v", clientFingerprint.ALPN))
+			if meta != nil && meta.ClientApp != "" {
+				fpDetails = append(fpDetails, fmt.Sprintf("ClientApp: %q", meta.ClientApp))
 			}
-			if clientFingerprint.JA3Hash != "" {
-				fpDetails = append(fpDetails, fmt.Sprintf("JA3=%s", clientFingerprint.JA3Hash))
+			if meta != nil && meta.Version != "" {
+				fpDetails = append(fpDetails, fmt.Sprintf("Ver: %s", meta.Version))
 			}
-		}
-		if meta != nil && meta.ClientApp != "" {
-			fpDetails = append(fpDetails, fmt.Sprintf("ClientApp: %q", meta.ClientApp))
-		}
-		if meta != nil && meta.Version != "" {
-			fpDetails = append(fpDetails, fmt.Sprintf("Ver: %s", meta.Version))
-		}
-		if meta != nil && meta.PaddingMD5 != "" {
-			fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
-		}
-		if len(fpDetails) > 0 {
-			log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
+			if meta != nil && meta.PaddingMD5 != "" {
+				fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
+			}
+			if len(fpDetails) > 0 {
+				log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
+			}
+		} else {
+			log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s (Confirmed AnyTLS session)",
+				clientAddr, origDst, sni)
 		}
 	}
-
-	// H-01: Clear deadlines before entering transparent stream relay
-	_ = clientConn.SetDeadline(time.Time{})
-	_ = uTLS.SetDeadline(time.Time{})
 
 	p.relayTLS(downstreamTLS, uTLS, brDecrypted, clientAddr, origDst)
 }

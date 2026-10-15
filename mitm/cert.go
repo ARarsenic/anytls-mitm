@@ -15,9 +15,10 @@ import (
 )
 
 type certCacheEntry struct {
-	key       string
-	cert      *tls.Certificate
-	expiresAt time.Time
+	key                string
+	cert               *tls.Certificate
+	negotiatedProtocol string
+	expiresAt          time.Time
 }
 
 // CertCloner handles in-memory ECDSA key management and 1:1 dynamic X.509
@@ -61,26 +62,32 @@ func NewCertClonerWithCapacity(maxEntries int, defaultTTL time.Duration) (*CertC
 
 // Get returns a cached cloned certificate for the given cacheKey if available and not expired.
 func (c *CertCloner) Get(cacheKey string) *tls.Certificate {
+	cert, _ := c.GetWithALPN(cacheKey)
+	return cert
+}
+
+// GetWithALPN returns a cached cloned certificate and upstream negotiated ALPN protocol.
+func (c *CertCloner) GetWithALPN(cacheKey string) (*tls.Certificate, string) {
 	if cacheKey == "" {
-		return nil
+		return nil, ""
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	elem, ok := c.cache[cacheKey]
 	if !ok {
-		return nil
+		return nil, ""
 	}
 
 	entry := elem.Value.(*certCacheEntry)
 	if time.Now().After(entry.expiresAt) {
 		c.lru.Remove(elem)
 		delete(c.cache, cacheKey)
-		return nil
+		return nil, ""
 	}
 
 	c.lru.MoveToFront(elem)
-	return entry.cert
+	return entry.cert, entry.negotiatedProtocol
 }
 
 // Clear flushes all cached certificates.
@@ -100,7 +107,13 @@ func (c *CertCloner) Len() int {
 
 // Clone clones an upstream X.509 certificate and signs it with the local ECDSA private key.
 // Cloned certificates are cached by cacheKey (e.g. OriginalDstIP:Port).
-func (c *CertCloner) Clone(upstreamCert *x509.Certificate, cacheKey string, sni string) (*tls.Certificate, error) {
+// Optionally, upstream negotiated ALPN protocol can be passed as the 4th argument.
+func (c *CertCloner) Clone(upstreamCert *x509.Certificate, cacheKey string, sni string, protos ...string) (*tls.Certificate, error) {
+	negotiatedProto := ""
+	if len(protos) > 0 {
+		negotiatedProto = protos[0]
+	}
+
 	if cacheKey != "" {
 		c.mu.Lock()
 		if elem, ok := c.cache[cacheKey]; ok {
@@ -194,9 +207,10 @@ func (c *CertCloner) Clone(upstreamCert *x509.Certificate, cacheKey string, sni 
 		if elem, ok := c.cache[cacheKey]; ok {
 			c.lru.MoveToFront(elem)
 			elem.Value = &certCacheEntry{
-				key:       cacheKey,
-				cert:      clonedCert,
-				expiresAt: expiresAt,
+				key:                cacheKey,
+				cert:               clonedCert,
+				negotiatedProtocol: negotiatedProto,
+				expiresAt:          expiresAt,
 			}
 		} else {
 			// Enforce max capacity by evicting oldest
@@ -209,9 +223,10 @@ func (c *CertCloner) Clone(upstreamCert *x509.Certificate, cacheKey string, sni 
 				}
 			}
 			newEntry := &certCacheEntry{
-				key:       cacheKey,
-				cert:      clonedCert,
-				expiresAt: expiresAt,
+				key:                cacheKey,
+				cert:               clonedCert,
+				negotiatedProtocol: negotiatedProto,
+				expiresAt:          expiresAt,
 			}
 			elem := c.lru.PushFront(newEntry)
 			c.cache[cacheKey] = elem
