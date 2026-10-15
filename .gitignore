@@ -1,0 +1,8 @@
+*.exe
+*.exe~
+*~
+*.dll
+*.sys
+*.lib
+*.log
+scratch/
