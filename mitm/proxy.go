@@ -130,7 +130,7 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		cfg.HandshakeTimeout = 10 * time.Second
 	}
 	if cfg.InspectTimeout <= 0 {
-		cfg.InspectTimeout = 5 * time.Second
+		cfg.InspectTimeout = 15 * time.Second
 	}
 
 	return &Proxy{
@@ -425,6 +425,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		},
 	}
 
+	wasCached := (p.certCloner.Get(origDst) != nil)
+
 	// H-01: Set read deadline for downstream TLS handshake
 	_ = clientConn.SetReadDeadline(time.Now().Add(p.config.HandshakeTimeout))
 
@@ -438,21 +440,25 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		}
 		if !p.confirmedAnyTLS.Contains(origDst) {
 			p.failMu.Lock()
-			p.handshakeFailures[origDst]++
+			if wasCached {
+				p.handshakeFailures[origDst]++
+			}
 			fails := p.handshakeFailures[origDst]
 			p.failMu.Unlock()
 
 			// Fast fail-open for normal internet browsing:
-			// If client sends explicit TLS alert rejection, OR fails consecutive attempts (e.g. Chrome/Safari/iOS closing socket on untrusted cert)
-			if isClientCertRejection(handshakeErr) || fails >= 2 {
+			// ONLY whitelist if client sent an explicit TLS alert rejection,
+			// OR if the cert was ALREADY cached (served with 0ms delay) and still failed 2+ consecutive times.
+			// Cold-start connections (wasCached == false) will NEVER whitelist, ensuring AnyTLS is not bypassed!
+			if isClientCertRejection(handshakeErr) || (wasCached && fails >= 2) {
 				if p.config.Verbose {
-					log.Printf("[Stage2-FailOpen] Adding %s to whitelist for fast bypass (failures=%d, err=%v)",
-						origDst, fails, handshakeErr)
+					log.Printf("[Stage2-FailOpen] Adding %s to whitelist for fast bypass (failures=%d, wasCached=%v, err=%v)",
+						origDst, fails, wasCached, handshakeErr)
 				}
 				p.whitelist.Add(origDst)
 			} else if p.config.Verbose {
-				log.Printf("[Stage2-FailOpen] Handshake failed for %s (attempt %d, not whitelisting yet): %v",
-					origDst, fails, handshakeErr)
+				log.Printf("[Stage2-FailOpen] Handshake failed for %s (attempt %d, wasCached=%v, not whitelisting yet): %v",
+					origDst, fails, wasCached, handshakeErr)
 			}
 		} else if p.config.Verbose {
 			log.Printf("[Stage2-FailOpen] Not whitelisting %s because it is a confirmed AnyTLS server", origDst)
@@ -480,17 +486,13 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	// Wait for upstream connection to complete
 	<-upstreamDone
 	if upstreamErr != nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy] Upstream TLS dial failed for %s: %v", origDst, upstreamErr)
-		}
+		log.Printf("[Proxy] Upstream TLS dial failed for %s: %v", origDst, upstreamErr)
 		return
 	}
 
 	uTLS := upstreamTLS
 	if uTLS == nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy] Upstream TLS connection is nil for %s", origDst)
-		}
+		log.Printf("[Proxy] Upstream TLS connection is nil for %s", origDst)
 		return
 	}
 	defer uTLS.Close()

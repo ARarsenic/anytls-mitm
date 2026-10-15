@@ -85,7 +85,7 @@ func main() {
 	flag.IntVar(&whitelistTTL, "whitelist-ttl", 30, "Fail-open whitelist TTL in minutes for non-AnyTLS/strict-cert hosts")
 	flag.IntVar(&maxConns, "max-conns", 2048, "Maximum concurrent TCP connections (DoS/Slowloris defense)")
 	flag.IntVar(&handshakeTimeout, "handshake-timeout", 10, "TLS handshake timeout in seconds (Slowloris defense)")
-	flag.IntVar(&inspectTimeout, "inspect-timeout", 5, "First-packet AnyTLS detection timeout in seconds")
+	flag.IntVar(&inspectTimeout, "inspect-timeout", 15, "First-packet AnyTLS detection timeout in seconds")
 	flag.BoolVar(&noDivert, "no-divert", false, "Run TCP proxy only without WinDivert packet redirection (for testing)")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose detailed connection and stream debug logging")
 	flag.Parse()

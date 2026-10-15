@@ -187,7 +187,7 @@ func (c *CertCloner) Clone(upstreamCert *x509.Certificate, cacheKey string, sni 
 	if cacheKey != "" {
 		c.mu.Lock()
 		expiresAt := time.Now().Add(c.defaultTTL)
-		if !upstreamCert.NotAfter.IsZero() && upstreamCert.NotAfter.Before(expiresAt) {
+		if !upstreamCert.NotAfter.IsZero() && upstreamCert.NotAfter.After(time.Now()) && upstreamCert.NotAfter.Before(expiresAt) {
 			expiresAt = upstreamCert.NotAfter
 		}
 
