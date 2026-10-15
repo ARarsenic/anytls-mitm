@@ -297,11 +297,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	if p.confirmedAnyTLS.Contains(origDst) {
 		p.whitelist.Remove(origDst)
 	} else if p.whitelist.Contains(origDst) {
-		// Strictly verified standard web PKI host (e.g. apple.com:443), bypass via raw TCP
-		if p.config.Verbose {
-			log.Printf("[Stage1-Whitelist-Bypass] Client: %s -> Server: %s (Destination in fail-open whitelist, splicing raw TCP)",
-				clientAddr, origDst)
-		}
+		// Strictly verified standard web PKI host (e.g. apple.com:443, 223.5.5.5:443), bypass via raw TCP
+		log.Printf("[WHITELIST-BYPASS] Client: %s -> Server: %s (Host in whitelist, spliced directly via Raw TCP)",
+			clientAddr, origDst)
 		_ = clientConn.SetDeadline(time.Time{})
 		p.relayRawTCP(clientConn, origDst, nil)
 		return
@@ -579,11 +577,9 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io.Reader) {
 	_ = clientConn.SetDeadline(time.Time{})
 
-	upstreamConn, err := net.DialTimeout("tcp", origDst, 5*time.Second)
+	upstreamConn, err := net.DialTimeout("tcp", origDst, 15*time.Second)
 	if err != nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy-RawTCP] Failed to dial raw TCP to %s: %v", origDst, err)
-		}
+		log.Printf("[Proxy-RawTCP] Failed to dial raw TCP to %s: %v", origDst, err)
 		return
 	}
 	defer upstreamConn.Close()
