@@ -18,22 +18,28 @@
 
 ```mermaid
 flowchart TD
-    Start(["客户端发起连接到目标服务器:端口"]) --> WinDivert["WinDivert 内核驱动重定向至本地代理 (10443)"]
-    WinDivert --> Stage1{"Stage 1: 是否已在白名单或非 TLS 流量?"}
-    Stage1 -- 是 --> RawPass["Raw TCP 直连透传 (绝不阻断常规流量)"]
-    Stage1 -- 否 --> Stage2["Stage 2: 向上游拉取真实证书并 1:1 动态克隆下发"]
+    Start(["客户端发起 TCP 连接<br/>目标: 外部服务器与端口"]) --> WinDivert["WinDivert 内核过滤驱动<br/>重定向流量至本地代理 (192.168.137.1:10443)"]
+    
+    WinDivert --> Stage1{"【Stage 1 预检】<br/>是否命中白名单 或 非 TLS 握手报文?"}
+    
+    Stage1 -- "是 (命中白名单 / 非 TLS)" --> RawPass["Raw TCP 直连透传<br/>(无缝放行，保障正常网页与应用访问)"]
+    
+    Stage1 -- "否 (未命中且首包为 TLS ClientHello)" --> Stage2["【Stage 2 动态证书探测】<br/>向上游拉取真实服务端证书<br/>1:1 动态克隆所有元数据并签署下发"]
     
     Stage2 --> ClientVerify{"客户端证书校验模式"}
     
-    ClientVerify -- "场景 A: skip-cert-verify: true" --> HandshakeOK["TLS 握手成功建立明文管道"]
-    ClientVerify -- "场景 B/C: 严格证书校验 / 指纹固定" --> HandshakeFail["客户端主动拒绝证书 (TLS Alert)"]
+    ClientVerify -- "【场景 A】skip-cert-verify: true<br/>(客户端跳过证书链合法性校验)" --> HandshakeOK["TLS 握手成功建立<br/>生成明文解密透明管道"]
     
-    HandshakeFail --> AddWhitelist["将目标 IP:Port 加入 Fail-Open 白名单"]
+    ClientVerify -- "【场景 B / C】严格 PKI 校验 / 证书固定 Pinning<br/>(客户端校验自签证书或证书哈希不通过)" --> HandshakeFail["客户端主动拒绝克隆证书<br/>发送 TLS Alert 告警并断开连接"]
+    
+    HandshakeFail --> AddWhitelist["将目标 IP:Port 记录至 Fail-Open 白名单<br/>(后续连接毫秒级回退至 Stage 1 直连透传)"]
     AddWhitelist --> RawPass
     
-    HandshakeOK --> Stage3["Stage 3: 首包无损二进制探测 AnyTLS 特征"]
-    Stage3 --> DetectMeta["提取客户端应用 (sing-box等) 与 TLS 指纹 (uTLS/JA3)"]
-    DetectMeta --> RelayPipe["双向解密流零拷贝透明管道 (io.Copy)"]
+    HandshakeOK --> Stage3["【Stage 3 首包二进制无损探测】<br/>通过 bufio.Reader.Peek() 偷窥解密首包<br/>校验 AnyTLS 协议特征结构"]
+    
+    Stage3 --> DetectMeta["提取元数据并输出审计日志<br/>• AnyTLS: client 软件、协议版本、AuthHash<br/>• TLS 指纹: uTLS 伪装类型、GREASE、JA3 散列"]
+    
+    DetectMeta --> RelayPipe["双向解密流零拷贝管道对接 (io.Copy)<br/>零深包解析与数据落盘，保障用户隐私"]
 ```
 
 ---
