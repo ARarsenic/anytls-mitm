@@ -200,9 +200,9 @@ func (r *Redirector) Stop() {
 }
 
 // formatTCPPacket extracts flags, seq, ack, and data length for granular network debugging.
-func formatTCPPacket(buf []byte, ihl int) string {
+func formatTCPPacket(buf []byte, ihl int) (string, int) {
 	if len(buf) < ihl+20 {
-		return "invalid"
+		return "invalid", 0
 	}
 	srcPort := binary.BigEndian.Uint16(buf[ihl : ihl+2])
 	dstPort := binary.BigEndian.Uint16(buf[ihl+2 : ihl+4])
@@ -211,6 +211,9 @@ func formatTCPPacket(buf []byte, ihl int) string {
 	tcpHdrLen := int(buf[ihl+12]>>4) * 4
 	flags := buf[ihl+13]
 	payloadLen := len(buf) - ihl - tcpHdrLen
+	if payloadLen < 0 {
+		payloadLen = 0
+	}
 
 	var f []string
 	if flags&0x02 != 0 {
@@ -230,7 +233,7 @@ func formatTCPPacket(buf []byte, ihl int) string {
 	}
 
 	return fmt.Sprintf("%d->%d [%s] Seq=%d Ack=%d DataLen=%d",
-		srcPort, dstPort, strings.Join(f, "|"), seq, ack, payloadLen)
+		srcPort, dstPort, strings.Join(f, "|"), seq, ack, payloadLen), payloadLen
 }
 
 // forwardLoop handles packets traversing the Windows Hotspot routing engine (LayerNetworkForward).
@@ -284,15 +287,16 @@ func (r *Redirector) forwardLoop() {
 			isSYN := (tcpFlags&0x02 != 0) && (tcpFlags&0x10 == 0)
 			isRST := (tcpFlags & 0x04) != 0
 
+			pktDesc, payloadLen := formatTCPPacket(buf[:n], ihl)
 			if isRST {
 				log.Printf("[Divert-RST] Hotspot Client sent TCP RST! %s -> %s | %s",
-					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
+					clientKey, origDst, pktDesc)
 			} else if isSYN {
 				log.Printf("[Divert-Forward] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d, captured IfIdx=%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort, addr.Network().InterfaceIndex)
-			} else {
+			} else if payloadLen > 0 || r.config.Verbose {
 				log.Printf("[Divert-Pkt] IN %s -> %s | %s",
-					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
+					clientKey, origDst, pktDesc)
 			}
 
 			// Rewrite destination IP and port to local proxy listener
@@ -312,7 +316,7 @@ func (r *Redirector) forwardLoop() {
 			}
 			netAddr.Network().SubInterfaceIndex = 0
 
-			if !divert.CalcChecksums(buf[:n], &netAddr, 0) {
+			if !calcChecksums(buf[:n], &netAddr, 0) {
 				log.Printf("[Divert-ERROR] Inbound CalcChecksums failed for %s -> %s", clientKey, origDst)
 			}
 
@@ -383,15 +387,16 @@ func (r *Redirector) networkLoop() {
 			isSYN := (tcpFlags&0x02 != 0) && (tcpFlags&0x10 == 0)
 			isRST := (tcpFlags & 0x04) != 0
 
+			pktDesc, payloadLen := formatTCPPacket(buf[:n], ihl)
 			if isRST {
 				log.Printf("[Divert-RST] Hotspot Client sent TCP RST (Net)! %s -> %s | %s",
-					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
+					clientKey, origDst, pktDesc)
 			} else if isSYN {
 				log.Printf("[Divert-Network] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort)
-			} else {
+			} else if payloadLen > 0 || r.config.Verbose {
 				log.Printf("[Divert-Pkt] IN-NET %s -> %s | %s",
-					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
+					clientKey, origDst, pktDesc)
 			}
 
 			copy(buf[16:20], r.listenIP.To4())
@@ -409,7 +414,7 @@ func (r *Redirector) networkLoop() {
 			}
 			inAddr.Network().SubInterfaceIndex = 0
 
-			if !divert.CalcChecksums(buf[:n], &inAddr, 0) {
+			if !calcChecksums(buf[:n], &inAddr, 0) {
 				log.Printf("[Divert-ERROR] Inbound (Net) CalcChecksums failed for %s -> %s", clientKey, origDst)
 			}
 			if _, err := r.netHandle.Send(buf[:n], &inAddr); err != nil {
@@ -451,18 +456,19 @@ func (r *Redirector) networkLoop() {
 						tcpFlags := buf[ihl+13]
 						isRST := (tcpFlags & 0x04) != 0
 
+						pktDesc, payloadLen := formatTCPPacket(buf[:n], ihl)
 						if isRST {
 							log.Printf("[Divert-RST] Windows Proxy sent TCP RST! %s:%d -> %s | %s",
-								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl))
+								origHost, origPortNum, clientKey, pktDesc)
 						} else if tcpFlags&0x12 == 0x12 {
 							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (ifIdx=%d, origIfIdx=%d)",
 								origHost, origPortNum, clientKey, outAddr.Network().InterfaceIndex, addr.Network().InterfaceIndex)
-						} else {
+						} else if payloadLen > 0 || r.config.Verbose {
 							log.Printf("[Divert-Pkt] OUT %s:%d -> %s | %s (ifIdx=%d)",
-								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl), outAddr.Network().InterfaceIndex)
+								origHost, origPortNum, clientKey, pktDesc, outAddr.Network().InterfaceIndex)
 						}
 
-						if !divert.CalcChecksums(buf[:n], &outAddr, 0) {
+						if !calcChecksums(buf[:n], &outAddr, 0) {
 							log.Printf("[Divert-ERROR] Outbound CalcChecksums failed for %s:%d -> %s", origHost, origPortNum, clientKey)
 						}
 						if _, err := r.netHandle.Send(buf[:n], &outAddr); err != nil {
