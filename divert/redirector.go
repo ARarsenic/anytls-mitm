@@ -287,11 +287,11 @@ func (r *Redirector) forwardLoop() {
 			if isRST {
 				log.Printf("[Divert-RST] Hotspot Client sent TCP RST! %s -> %s | %s",
 					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
-			} else if isSYN && r.config.Verbose {
+			} else if isSYN {
 				log.Printf("[Divert-Forward] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d, captured IfIdx=%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort, addr.Network().InterfaceIndex)
-			} else if r.config.Verbose {
-				log.Printf("[Divert-Forward] Inbound: %s -> %s | %s",
+			} else {
+				log.Printf("[Divert-Pkt] IN %s -> %s | %s",
 					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
 			}
 
@@ -312,15 +312,15 @@ func (r *Redirector) forwardLoop() {
 			}
 			netAddr.Network().SubInterfaceIndex = 0
 
-			divert.CalcChecksums(buf[:n], &netAddr, 0)
+			if !divert.CalcChecksums(buf[:n], &netAddr, 0) {
+				log.Printf("[Divert-ERROR] Inbound CalcChecksums failed for %s -> %s", clientKey, origDst)
+			}
 
 			// Inject into local network stack so local proxy listener receives it
 			nSent, err := r.netHandle.Send(buf[:n], &netAddr)
 			if err != nil {
-				if r.config.Verbose {
-					log.Printf("[Divert-Forward] Error reinjecting to local stack on ifIdx=%d: %v",
-						netAddr.Network().InterfaceIndex, err)
-				}
+				log.Printf("[Divert-Forward-ERROR] Error reinjecting to local stack on ifIdx=%d: %v",
+					netAddr.Network().InterfaceIndex, err)
 			} else if isSYN && r.config.Verbose {
 				log.Printf("[Divert-Forward] Successfully reinjected SYN to local stack on ifIdx=%d (%d bytes)",
 					netAddr.Network().InterfaceIndex, nSent)
@@ -386,11 +386,11 @@ func (r *Redirector) networkLoop() {
 			if isRST {
 				log.Printf("[Divert-RST] Hotspot Client sent TCP RST (Net)! %s -> %s | %s",
 					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
-			} else if isSYN && r.config.Verbose {
+			} else if isSYN {
 				log.Printf("[Divert-Network] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort)
-			} else if r.config.Verbose {
-				log.Printf("[Divert-Network] Inbound: %s -> %s | %s",
+			} else {
+				log.Printf("[Divert-Pkt] IN-NET %s -> %s | %s",
 					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
 			}
 
@@ -409,9 +409,11 @@ func (r *Redirector) networkLoop() {
 			}
 			inAddr.Network().SubInterfaceIndex = 0
 
-			divert.CalcChecksums(buf[:n], &inAddr, 0)
-			if _, err := r.netHandle.Send(buf[:n], &inAddr); err != nil && r.config.Verbose {
-				log.Printf("[Divert-Net] Failed to reinject inbound on ifIdx=%d: %v",
+			if !divert.CalcChecksums(buf[:n], &inAddr, 0) {
+				log.Printf("[Divert-ERROR] Inbound (Net) CalcChecksums failed for %s -> %s", clientKey, origDst)
+			}
+			if _, err := r.netHandle.Send(buf[:n], &inAddr); err != nil {
+				log.Printf("[Divert-Net-ERROR] Failed to reinject inbound on ifIdx=%d: %v",
 					inAddr.Network().InterfaceIndex, err)
 			}
 			continue
@@ -452,15 +454,17 @@ func (r *Redirector) networkLoop() {
 						if isRST {
 							log.Printf("[Divert-RST] Windows Proxy sent TCP RST! %s:%d -> %s | %s",
 								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl))
-						} else if tcpFlags&0x12 == 0x12 && r.config.Verbose {
-							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (ifIdx=%d)",
-								origHost, origPortNum, clientKey, outAddr.Network().InterfaceIndex)
-						} else if r.config.Verbose {
-							log.Printf("[Divert-Net] Outbound: %s:%d -> %s | %s",
-								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl))
+						} else if tcpFlags&0x12 == 0x12 {
+							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (ifIdx=%d, origIfIdx=%d)",
+								origHost, origPortNum, clientKey, outAddr.Network().InterfaceIndex, addr.Network().InterfaceIndex)
+						} else {
+							log.Printf("[Divert-Pkt] OUT %s:%d -> %s | %s (ifIdx=%d)",
+								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl), outAddr.Network().InterfaceIndex)
 						}
 
-						divert.CalcChecksums(buf[:n], &outAddr, 0)
+						if !divert.CalcChecksums(buf[:n], &outAddr, 0) {
+							log.Printf("[Divert-ERROR] Outbound CalcChecksums failed for %s:%d -> %s", origHost, origPortNum, clientKey)
+						}
 						if _, err := r.netHandle.Send(buf[:n], &outAddr); err != nil {
 							log.Printf("[Divert-Net-ERROR] Failed to reinject outbound reply to %s on ifIdx=%d: %v",
 								clientKey, outAddr.Network().InterfaceIndex, err)

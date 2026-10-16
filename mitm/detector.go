@@ -235,6 +235,11 @@ func DescribeAnyTLSChunk(b []byte, isClientFirstPacket bool) []string {
 		frameTotal := 7 + dlen
 		cmdName := AnyTLSCommandName(cmd)
 
+		if cmd > 10 {
+			descriptions = append(descriptions, fmt.Sprintf("ContinuationPayload(%d bytes)", len(b)-offset))
+			break
+		}
+
 		if offset+frameTotal > len(b) {
 			descriptions = append(descriptions, fmt.Sprintf("%s(Stream=%d, NeedLen=%d, RemainingBytes=%d)",
 				cmdName, sid, dlen, len(b)-offset-7))
