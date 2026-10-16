@@ -632,13 +632,25 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 					log.Printf("[AnyTLS-Flow] [U->C %s] Relayed %d bytes payload", clientAddr, nr)
 				}
 
-				nw, ew := downstreamTLS.Write(buf[:nr])
-				if nw > 0 {
-					u2cBytes += int64(nw)
+				// Write to downstream TLS in MTU-safe chunks <= 1300 bytes to avoid oversized packets / LSO drop on virtual Wi-Fi adapter
+				toWrite := buf[:nr]
+				for len(toWrite) > 0 {
+					chunk := len(toWrite)
+					if chunk > 1300 {
+						chunk = 1300
+					}
+					nw, ew := downstreamTLS.Write(toWrite[:chunk])
+					if nw > 0 {
+						u2cBytes += int64(nw)
+					}
+					if ew != nil {
+						u2cErr = ew
+						log.Printf("[Proxy-Relay] [U->C %s] Write to client error: %v", clientAddr, ew)
+						break
+					}
+					toWrite = toWrite[chunk:]
 				}
-				if ew != nil {
-					u2cErr = ew
-					log.Printf("[Proxy-Relay] [U->C %s] Write to client error: %v", clientAddr, ew)
+				if u2cErr != nil {
 					break
 				}
 			}

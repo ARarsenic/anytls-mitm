@@ -199,6 +199,40 @@ func (r *Redirector) Stop() {
 	}
 }
 
+// formatTCPPacket extracts flags, seq, ack, and data length for granular network debugging.
+func formatTCPPacket(buf []byte, ihl int) string {
+	if len(buf) < ihl+20 {
+		return "invalid"
+	}
+	srcPort := binary.BigEndian.Uint16(buf[ihl : ihl+2])
+	dstPort := binary.BigEndian.Uint16(buf[ihl+2 : ihl+4])
+	seq := binary.BigEndian.Uint32(buf[ihl+4 : ihl+8])
+	ack := binary.BigEndian.Uint32(buf[ihl+8 : ihl+12])
+	tcpHdrLen := int(buf[ihl+12]>>4) * 4
+	flags := buf[ihl+13]
+	payloadLen := len(buf) - ihl - tcpHdrLen
+
+	var f []string
+	if flags&0x02 != 0 {
+		f = append(f, "SYN")
+	}
+	if flags&0x10 != 0 {
+		f = append(f, "ACK")
+	}
+	if flags&0x08 != 0 {
+		f = append(f, "PSH")
+	}
+	if flags&0x01 != 0 {
+		f = append(f, "FIN")
+	}
+	if flags&0x04 != 0 {
+		f = append(f, "RST")
+	}
+
+	return fmt.Sprintf("%d->%d [%s] Seq=%d Ack=%d DataLen=%d",
+		srcPort, dstPort, strings.Join(f, "|"), seq, ack, payloadLen)
+}
+
 // forwardLoop handles packets traversing the Windows Hotspot routing engine (LayerNetworkForward).
 func (r *Redirector) forwardLoop() {
 	buf := make([]byte, 65535)
@@ -248,9 +282,17 @@ func (r *Redirector) forwardLoop() {
 
 			tcpFlags := buf[ihl+13]
 			isSYN := (tcpFlags&0x02 != 0) && (tcpFlags&0x10 == 0)
-			if isSYN && r.config.Verbose {
+			isRST := (tcpFlags & 0x04) != 0
+
+			if isRST {
+				log.Printf("[Divert-RST] Hotspot Client sent TCP RST! %s -> %s | %s",
+					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
+			} else if isSYN && r.config.Verbose {
 				log.Printf("[Divert-Forward] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d, captured IfIdx=%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort, addr.Network().InterfaceIndex)
+			} else if r.config.Verbose {
+				log.Printf("[Divert-Forward] Inbound: %s -> %s | %s",
+					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
 			}
 
 			// Rewrite destination IP and port to local proxy listener
@@ -339,9 +381,17 @@ func (r *Redirector) networkLoop() {
 
 			tcpFlags := buf[ihl+13]
 			isSYN := (tcpFlags&0x02 != 0) && (tcpFlags&0x10 == 0)
-			if isSYN && r.config.Verbose {
+			isRST := (tcpFlags & 0x04) != 0
+
+			if isRST {
+				log.Printf("[Divert-RST] Hotspot Client sent TCP RST (Net)! %s -> %s | %s",
+					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
+			} else if isSYN && r.config.Verbose {
 				log.Printf("[Divert-Network] Intercepted Hotspot Client TCP SYN: %s -> %s (redirecting to proxy %s:%d)",
 					clientKey, origDst, r.listenIP, r.config.ListenPort)
+			} else if r.config.Verbose {
+				log.Printf("[Divert-Network] Inbound: %s -> %s | %s",
+					clientKey, origDst, formatTCPPacket(buf[:n], ihl))
 			}
 
 			copy(buf[16:20], r.listenIP.To4())
@@ -397,9 +447,17 @@ func (r *Redirector) networkLoop() {
 						outAddr.Network().SubInterfaceIndex = 0
 
 						tcpFlags := buf[ihl+13]
-						if tcpFlags&0x12 == 0x12 && r.config.Verbose {
+						isRST := (tcpFlags & 0x04) != 0
+
+						if isRST {
+							log.Printf("[Divert-RST] Windows Proxy sent TCP RST! %s:%d -> %s | %s",
+								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl))
+						} else if tcpFlags&0x12 == 0x12 && r.config.Verbose {
 							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (ifIdx=%d)",
 								origHost, origPortNum, clientKey, outAddr.Network().InterfaceIndex)
+						} else if r.config.Verbose {
+							log.Printf("[Divert-Net] Outbound: %s:%d -> %s | %s",
+								origHost, origPortNum, clientKey, formatTCPPacket(buf[:n], ihl))
 						}
 
 						divert.CalcChecksums(buf[:n], &outAddr, 0)
