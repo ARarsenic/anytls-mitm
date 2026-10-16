@@ -365,9 +365,13 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				})
 				if err != nil {
 					upstreamErr = err
+					log.Printf("[Proxy-TLS] Upstream TLS dial failed for %s (SNI: %q, protos: %v): %v", origDst, serverName, protos, err)
 					return
 				}
 				upstreamTLS = u
+				state := u.ConnectionState()
+				log.Printf("[Proxy-TLS] Upstream TLS connected to %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
+					origDst, state.Version, state.CipherSuite, state.NegotiatedProtocol)
 			}()
 		})
 	}
@@ -442,10 +446,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	downstreamTLS := tls.Server(wrappedClientConn, serverTLSConfig)
 	handshakeErr := downstreamTLS.Handshake()
 	if handshakeErr != nil {
-		if p.config.Verbose {
-			log.Printf("[Stage2-FailOpen] Downstream TLS handshake failed for %s -> %s: %v",
-				clientAddr, origDst, handshakeErr)
-		}
+		log.Printf("[Proxy-TLS] Downstream TLS handshake FAILED for %s -> %s: %v",
+			clientAddr, origDst, handshakeErr)
 
 		// Fail-open for standard web browsing:
 		// ONLY whitelist if:
@@ -470,10 +472,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	if p.config.Verbose {
-		log.Printf("[Stage2-Success] Downstream TLS handshake SUCCESS for %s -> %s! Client accepted cloned certificate.",
-			clientAddr, origDst)
-	}
+	downstreamState := downstreamTLS.ConnectionState()
+	log.Printf("[Proxy-TLS] Downstream TLS handshake SUCCESS for %s -> %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
+		clientAddr, origDst, downstreamState.Version, downstreamState.CipherSuite, downstreamState.NegotiatedProtocol)
 
 	// Wait for upstream connection to complete
 	<-upstreamDone
@@ -564,24 +565,101 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 // relayTLS transparently bridges decrypted downstream and upstream TLS streams.
 func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *bufio.Reader, clientAddr, origDst string) {
-	var wg sync.WaitGroup
+	log.Printf("[Proxy-Relay] >>> Streaming started for %s <-> %s", clientAddr, origDst)
+
+	var (
+		c2uBytes int64
+		c2uErr   error
+		u2cBytes int64
+		u2cErr   error
+		wg       sync.WaitGroup
+	)
 	wg.Add(2)
 
+	// Goroutine 1: Client -> Upstream
 	go func() {
 		defer wg.Done()
 		defer uTLS.Close()
 		defer downstreamTLS.Close()
-		_, _ = io.Copy(uTLS, brDecrypted)
+
+		buf := make([]byte, 32768)
+		first := true
+		for {
+			nr, er := brDecrypted.Read(buf)
+			if nr > 0 {
+				if first {
+					first = false
+					previewLen := nr
+					if previewLen > 48 {
+						previewLen = 48
+					}
+					log.Printf("[Proxy-Relay] [C->U %s] First payload (%d bytes, hex: %x)",
+						clientAddr, nr, buf[:previewLen])
+				}
+				nw, ew := uTLS.Write(buf[:nr])
+				if nw > 0 {
+					c2uBytes += int64(nw)
+				}
+				if ew != nil {
+					c2uErr = ew
+					log.Printf("[Proxy-Relay] [C->U %s] Write to upstream error: %v", clientAddr, ew)
+					break
+				}
+			}
+			if er != nil {
+				if er != io.EOF {
+					c2uErr = er
+					log.Printf("[Proxy-Relay] [C->U %s] Read from client error: %v", clientAddr, er)
+				}
+				break
+			}
+		}
 	}()
 
+	// Goroutine 2: Upstream -> Client
 	go func() {
 		defer wg.Done()
 		defer downstreamTLS.Close()
 		defer uTLS.Close()
-		_, _ = io.Copy(downstreamTLS, uTLS)
+
+		buf := make([]byte, 32768)
+		first := true
+		for {
+			nr, er := uTLS.Read(buf)
+			if nr > 0 {
+				if first {
+					first = false
+					previewLen := nr
+					if previewLen > 48 {
+						previewLen = 48
+					}
+					previewStr := string(buf[:previewLen])
+					log.Printf("[Proxy-Relay] [U->C %s] First server response (%d bytes, hex: %x, ascii: %q)",
+						clientAddr, nr, buf[:previewLen], previewStr)
+				}
+				nw, ew := downstreamTLS.Write(buf[:nr])
+				if nw > 0 {
+					u2cBytes += int64(nw)
+				}
+				if ew != nil {
+					u2cErr = ew
+					log.Printf("[Proxy-Relay] [U->C %s] Write to client error: %v", clientAddr, ew)
+					break
+				}
+			}
+			if er != nil {
+				if er != io.EOF {
+					u2cErr = er
+					log.Printf("[Proxy-Relay] [U->C %s] Read from upstream error: %v", clientAddr, er)
+				}
+				break
+			}
+		}
 	}()
 
 	wg.Wait()
+	log.Printf("[Proxy-Relay] <<< Stream ended for %s <-> %s | Client->Upstream: %d bytes (err: %v) | Upstream->Client: %d bytes (err: %v)",
+		clientAddr, origDst, c2uBytes, c2uErr, u2cBytes, u2cErr)
 }
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.

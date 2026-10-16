@@ -387,12 +387,15 @@ func (r *Redirector) networkLoop() {
 						}
 
 						divert.CalcChecksums(buf[:n], &addr, 0)
-						if _, err := r.netHandle.Send(buf[:n], &addr); err != nil && r.config.Verbose {
-							log.Printf("[Divert-Net] Failed to reinject outbound reply: %v", err)
+						if _, err := r.netHandle.Send(buf[:n], &addr); err != nil {
+							log.Printf("[Divert-Net-ERROR] Failed to reinject outbound reply to %s: %v", clientKey, err)
 						}
 						continue
 					}
 				}
+			} else {
+				log.Printf("[Divert-Net-WARNING] Reply from proxy port %d to %s has NO NAT mapping in table! Packet will retain proxy IP %s",
+					r.config.ListenPort, clientKey, r.listenIP)
 			}
 		}
 
