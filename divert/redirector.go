@@ -347,12 +347,22 @@ func (r *Redirector) networkLoop() {
 			copy(buf[16:20], r.listenIP.To4())
 			binary.BigEndian.PutUint16(buf[ihl+2:ihl+4], r.config.ListenPort)
 
-			addr.Flags &= ^uint8(0x02) // Inbound
-			addr.Flags |= 0x08         // Impostor
+			// Clean Address initialized for LayerNetwork Inbound
+			var inAddr divert.Address
+			inAddr.SetLayer(divert.LayerNetwork)
+			inAddr.Flags = 0x08 // Impostor = true, Outbound = false
 
-			divert.CalcChecksums(buf[:n], &addr, 0)
-			if _, err := r.netHandle.Send(buf[:n], &addr); err != nil && r.config.Verbose {
-				log.Printf("[Divert-Net] Failed to reinject inbound: %v", err)
+			if r.hotspotIfIdx > 0 {
+				inAddr.Network().InterfaceIndex = r.hotspotIfIdx
+			} else {
+				inAddr.Network().InterfaceIndex = addr.Network().InterfaceIndex
+			}
+			inAddr.Network().SubInterfaceIndex = 0
+
+			divert.CalcChecksums(buf[:n], &inAddr, 0)
+			if _, err := r.netHandle.Send(buf[:n], &inAddr); err != nil && r.config.Verbose {
+				log.Printf("[Divert-Net] Failed to reinject inbound on ifIdx=%d: %v",
+					inAddr.Network().InterfaceIndex, err)
 			}
 			continue
 		}
@@ -372,23 +382,30 @@ func (r *Redirector) networkLoop() {
 						copy(buf[12:16], origIP)
 						binary.BigEndian.PutUint16(buf[ihl:ihl+2], uint16(origPortNum))
 
-						addr.Flags |= 0x02 // Outbound
-						addr.Flags |= 0x08 // Impostor
+						// Re-initialize clean Address for LayerNetwork Outbound
+						// Crucial: Clear offload flags so full software checksum is embedded in the packet
+						// and explicitly specify hotspotIfIdx so Windows transmits out the Wi-Fi Direct radio
+						var outAddr divert.Address
+						outAddr.SetLayer(divert.LayerNetwork)
+						outAddr.Flags = 0x02 | 0x08 // Outbound = true, Impostor = true
 
-						if pktLen > 1500 && r.config.Verbose {
-							log.Printf("[Divert-Net] WARNING: Outbound packet to %s is %d bytes (> MTU 1500)! May be dropped by Wi-Fi driver.",
-								clientKey, pktLen)
+						if r.hotspotIfIdx > 0 {
+							outAddr.Network().InterfaceIndex = r.hotspotIfIdx
+						} else {
+							outAddr.Network().InterfaceIndex = addr.Network().InterfaceIndex
 						}
+						outAddr.Network().SubInterfaceIndex = 0
 
 						tcpFlags := buf[ihl+13]
 						if tcpFlags&0x12 == 0x12 && r.config.Verbose {
-							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (from proxy port %d)",
-								origHost, origPortNum, clientKey, r.config.ListenPort)
+							log.Printf("[Divert-Net] Relaying SYN-ACK reply: %s:%d -> %s (ifIdx=%d)",
+								origHost, origPortNum, clientKey, outAddr.Network().InterfaceIndex)
 						}
 
-						divert.CalcChecksums(buf[:n], &addr, 0)
-						if _, err := r.netHandle.Send(buf[:n], &addr); err != nil {
-							log.Printf("[Divert-Net-ERROR] Failed to reinject outbound reply to %s: %v", clientKey, err)
+						divert.CalcChecksums(buf[:n], &outAddr, 0)
+						if _, err := r.netHandle.Send(buf[:n], &outAddr); err != nil {
+							log.Printf("[Divert-Net-ERROR] Failed to reinject outbound reply to %s on ifIdx=%d: %v",
+								clientKey, outAddr.Network().InterfaceIndex, err)
 						}
 						continue
 					}

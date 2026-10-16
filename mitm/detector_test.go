@@ -190,3 +190,43 @@ func TestInspectAnyTLSFirstPacket_Truncated(t *testing.T) {
 		t.Fatalf("expected error on truncated data")
 	}
 }
+
+func TestDescribeAnyTLSChunk(t *testing.T) {
+	// Test Server response chunk: cmdServerSettings (10 bytes) + cmdSYNACK (7 bytes)
+	// 0a 00000000 0003 763d32
+	serverSettings := []byte{0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 'v', '=', '2'}
+	// 07 00000001 0000
+	synAck := []byte{0x07, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}
+	chunk := append(serverSettings, synAck...)
+
+	desc := DescribeAnyTLSChunk(chunk, false)
+	if len(desc) != 2 {
+		t.Fatalf("expected 2 frames described, got %d: %v", len(desc), desc)
+	}
+	if desc[0] != "cmdServerSettings(Stream=0, v=2)" {
+		t.Errorf("unexpected desc[0]: %s", desc[0])
+	}
+	if desc[1] != "cmdSYNACK(Stream=1, SUCCESS)" {
+		t.Errorf("unexpected desc[1]: %s", desc[1])
+	}
+
+	// Test Client chunk with SocksAddr domain
+	socksAddr := []byte{0x03, 0x0a, 'g', 'o', 'o', 'g', 'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb} // google.com:443
+	pshFrame := new(bytes.Buffer)
+	pshFrame.WriteByte(CmdPSH)
+	var sidBuf [4]byte
+	binary.BigEndian.PutUint32(sidBuf[:], 1)
+	pshFrame.Write(sidBuf[:])
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(socksAddr)))
+	pshFrame.Write(lenBuf[:])
+	pshFrame.Write(socksAddr)
+
+	descClient := DescribeAnyTLSChunk(pshFrame.Bytes(), false)
+	if len(descClient) != 1 {
+		t.Fatalf("expected 1 frame, got %d", len(descClient))
+	}
+	if descClient[0] != "cmdPSH(Stream=1, Target: google.com:443)" {
+		t.Errorf("unexpected desc: %s", descClient[0])
+	}
+}

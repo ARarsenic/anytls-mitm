@@ -587,15 +587,14 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 		for {
 			nr, er := brDecrypted.Read(buf)
 			if nr > 0 {
-				if first {
-					first = false
-					previewLen := nr
-					if previewLen > 48 {
-						previewLen = 48
-					}
-					log.Printf("[Proxy-Relay] [C->U %s] First payload (%d bytes, hex: %x)",
-						clientAddr, nr, buf[:previewLen])
+				frames := DescribeAnyTLSChunk(buf[:nr], first)
+				if len(frames) > 0 {
+					log.Printf("[AnyTLS-Flow] [C->U %s] %s", clientAddr, strings.Join(frames, " | "))
+				} else {
+					log.Printf("[AnyTLS-Flow] [C->U %s] Relayed %d bytes payload", clientAddr, nr)
 				}
+				first = false
+
 				nw, ew := uTLS.Write(buf[:nr])
 				if nw > 0 {
 					c2uBytes += int64(nw)
@@ -623,20 +622,16 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 		defer uTLS.Close()
 
 		buf := make([]byte, 32768)
-		first := true
 		for {
 			nr, er := uTLS.Read(buf)
 			if nr > 0 {
-				if first {
-					first = false
-					previewLen := nr
-					if previewLen > 48 {
-						previewLen = 48
-					}
-					previewStr := string(buf[:previewLen])
-					log.Printf("[Proxy-Relay] [U->C %s] First server response (%d bytes, hex: %x, ascii: %q)",
-						clientAddr, nr, buf[:previewLen], previewStr)
+				frames := DescribeAnyTLSChunk(buf[:nr], false)
+				if len(frames) > 0 {
+					log.Printf("[AnyTLS-Flow] [U->C %s] %s", clientAddr, strings.Join(frames, " | "))
+				} else {
+					log.Printf("[AnyTLS-Flow] [U->C %s] Relayed %d bytes payload", clientAddr, nr)
 				}
+
 				nw, ew := downstreamTLS.Write(buf[:nr])
 				if nw > 0 {
 					u2cBytes += int64(nw)
