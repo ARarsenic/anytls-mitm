@@ -104,7 +104,7 @@ sequenceDiagram
   - **1:1 动态证书克隆**：向上游建立 TLS 握手获取原始证书并 1:1 复制（Subject、Issuer、DNS SAN、IPAddresses 及有效期），并存入证书缓存实现毫秒级快速握手。
   - **精准白名单防误杀**：严格区分真正的**客户端证书警报拒绝**（如 `bad certificate`、`unknown certificate authority`）与**普通网络抖动/并发探测 RST（`wsarecv`）/连接超时**。只有确认为证书拒绝时才加入白名单，防止因客户端并发建连测速而误杀 AnyTLS 节点。
 - **Stage 3 (无损二进制协议探测与指纹提取)**：
-  - 利用 `bufio.Reader.Peek()` 偷窥解密后的首包流，匹配 AnyTLS 协议特征结构：
+  - 转发读取到的数据时，同步观察最多 65536 字节的内存前缀，匹配 AnyTLS 协议特征结构；不为识别额外读取或等待首包，也不阻塞服务器向客户端发送数据：
     ```text
     +------------------------------------+------------------+------------------+------------------+
     | SHA256(password) Hash (32 字节)    | Padding0 长度 L0 | Padding0 数据    | 7 字节帧头       |
@@ -199,7 +199,7 @@ go build -o anytls-mitm.exe .
 当热点下的设备访问 AnyTLS 代理节点时，控制台将输出高亮识别审计日志：
 
 ```text
-2026/10/15 17:33:42 [ANYTLS-MITM-SUCCESS] Client: 192.168.137.62:59634 -> Server: xx.xx.xx.xx:8443 | SNI: drivers.amd.com | AuthHash(SHA256): c99893672eb6abe151b23b433c1dbc5a6a8c8b7b9e170d308c42ebbcdf332029
+2026/10/15 17:33:42 [ANYTLS-DETECTED] Client: 192.168.137.62:59634 -> Server: xx.xx.xx.xx:8443 | SNI: drivers.amd.com | AuthHash(SHA256): c99893672eb6abe151b23b433c1dbc5a6a8c8b7b9e170d308c42ebbcdf332029
 2026/10/15 17:33:42 [ANYTLS-FINGERPRINT]  TLS-Fingerprint: uTLS (Chrome/Chromium/Edge 伪装) | GREASE=True | ALPN=[h2 http/1.1] | JA3=b32309a26cedf138e0f0e009493a3f32 | ClientApp: "sing-box 1.10.0" | Ver: "1"
 ```
 
@@ -241,3 +241,16 @@ go test -v ./...
 - 客户端 TLS 指纹识别：RFC 8701 GREASE 特征识别、JA3 MD5 计算、uTLS 模拟特征分类。
 - 保证探测操作是**无损读取**（不消耗底层 Reader 数据缓冲区）。
 - 对 HTTP/1.1 GET/POST、HTTP/2 preface 报文及随机二进制噪声的即时过滤与剔除。
+
+
+## 9. 连接失败调试
+
+`[ANYTLS-DETECTED]` 仅表示识别到了协议结构，不代表服务器认证成功、内层 stream 建立成功或网站可访问。
+
+- `[Proxy-Relay] ... setup=...` 表示从接受连接到开始双向转发的耗时。
+- `stream ended ... age=...` 表示连接结束时距接受连接的时间。结合设备端日志判断是否为客户端请求超时。
+- 若先出现客户端 RST，随后出现另一方向 `use of closed network connection`，后者通常是代理清理连接的结果。
+
+握手阶段最多等待 10 秒，进入转发后清除这个超时。首次连接与证书缓存命中都使用上游实际选择的 ALPN；证书缓存按目标地址和 SNI 区分。
+
+本地回归测试使用真实 TCP/TLS 连接，覆盖服务器先响应、认证与首帧分段发送，以及首次/缓存连接的 ALPN 一致性；不需要管理员权限或 WinDivert 驱动。这些测试不能替代移动热点、ICS 和实际客户端的端到端测试。

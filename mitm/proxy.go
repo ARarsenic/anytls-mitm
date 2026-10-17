@@ -26,9 +26,9 @@ type ProxyConfig struct {
 
 // Proxy implements the 3-stage MITM pipeline for intercepted hotspot traffic.
 type Proxy struct {
-	config     ProxyConfig
-	listener   net.Listener
-	natTable   *divert.NATTable
+	config          ProxyConfig
+	listener        net.Listener
+	natTable        *divert.NATTable
 	whitelist       *WhitelistCache
 	confirmedAnyTLS sync.Map
 	certCloner      *CertCloner
@@ -116,6 +116,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
+	started := time.Now()
+	clientConn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// Look up original destination from NAT table (with retry loop)
 	var origDst string
@@ -174,24 +176,41 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		sni               string
 		clientFingerprint *TLSFingerprintInfo
 		dialOnce          sync.Once
+		dialStarted       bool
 	)
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 10*time.Second)
+	defer func() {
+		cancelDial()
+		if dialStarted {
+			<-upstreamDone
+			if upstreamTLS != nil {
+				upstreamTLS.Close()
+			}
+		}
+	}()
+	// Bound TLS setup without leaving deadlines on the application streams.
+	clientConn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	startDialUpstream := func(serverName string, protos []string) {
 		dialOnce.Do(func() {
+			dialStarted = true
 			go func() {
 				defer close(upstreamDone)
 				dialer := &net.Dialer{Timeout: 10 * time.Second}
 				log.Printf("[Proxy-TLS] Dialing upstream TLS to %s (SNI: %q, protos: %v)...", origDst, serverName, protos)
-				u, err := tls.DialWithDialer(dialer, "tcp", origDst, &tls.Config{
+				tlsDialer := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{
 					ServerName:         serverName,
 					InsecureSkipVerify: true,
 					NextProtos:         protos,
-				})
+				}}
+				conn, err := tlsDialer.DialContext(dialCtx, "tcp", origDst)
 				if err != nil {
 					upstreamErr = err
 					log.Printf("[Proxy-TLS] Upstream TLS dial failed for %s: %v", origDst, err)
 					return
 				}
+				u := conn.(*tls.Conn)
 				upstreamTLS = u
 				state := u.ConnectionState()
 				log.Printf("[Proxy-TLS] Upstream TLS connected to %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
@@ -205,22 +224,11 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			sni = hello.ServerName
 			clientFingerprint = AnalyzeTLSFingerprint(hello)
 
-			// Fast Path: If certificate is already cloned and cached, return it immediately!
-			if cachedCert := p.certCloner.Get(origDst); cachedCert != nil {
-				log.Printf("[Proxy-Cert] Fast path: using cached certificate for %s (SNI: %q)", origDst, sni)
-				startDialUpstream(sni, hello.SupportedProtos)
-				return &tls.Config{
-					Certificates: []tls.Certificate{*cachedCert},
-				}, nil
-			}
-
-			// Slow Path (first connection only): Dial upstream synchronously to fetch & clone cert
-			log.Printf("[Stage2-Cloning] First connection to %s, dialing upstream to fetch certificate (SNI: %q)...",
-				origDst, sni)
+			// Both legs must negotiate the same ALPN, including cache hits.
+			// A cached certificate cannot predict the upstream selection.
 			startDialUpstream(sni, hello.SupportedProtos)
 			<-upstreamDone
 			if upstreamErr != nil {
-				log.Printf("[Stage2-Cloning] Failed to dial upstream TLS %s: %v", origDst, upstreamErr)
 				return nil, fmt.Errorf("upstream tls dial failed to %s: %w", origDst, upstreamErr)
 			}
 
@@ -238,12 +246,14 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 					peerCert.Subject, peerCert.Issuer, peerCert.DNSNames)
 			}
 
-			clonedCert, err := p.certCloner.Clone(peerCert, origDst, sni)
-			if err != nil {
-				if p.config.Verbose {
-					log.Printf("[Stage2-Cloning] Certificate cloning failed: %v", err)
+			cacheKey := origDst + "|" + sni
+			clonedCert := p.certCloner.Get(cacheKey)
+			if clonedCert == nil {
+				var err error
+				clonedCert, err = p.certCloner.Clone(peerCert, cacheKey, sni)
+				if err != nil {
+					return nil, fmt.Errorf("certificate cloning failed: %w", err)
 				}
-				return nil, fmt.Errorf("certificate cloning failed: %w", err)
 			}
 
 			cfg := &tls.Config{
@@ -275,15 +285,10 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			log.Printf("[Stage2-FailOpen] Not whitelisting %s because it is a confirmed AnyTLS server", origDst)
 		}
 
-		go func() {
-			<-upstreamDone
-			if upstreamTLS != nil {
-				upstreamTLS.Close()
-			}
-		}()
 		return
 	}
 
+	clientConn.SetDeadline(time.Time{})
 	downstreamState := downstreamTLS.ConnectionState()
 	log.Printf("[Proxy-TLS] Downstream TLS handshake SUCCESS for %s -> %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
 		clientAddr, origDst, downstreamState.Version, downstreamState.CipherSuite, downstreamState.NegotiatedProtocol)
@@ -305,52 +310,51 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	// -------------------------------------------------------------
 	// Stage 3: First-Packet AnyTLS Identification & Transparent Relay
 	// -------------------------------------------------------------
-	brDecrypted := bufio.NewReaderSize(downstreamTLS, 65536)
-	matched, authHash, meta, err := InspectAnyTLS(brDecrypted)
-	if err != nil && p.config.Verbose {
-		log.Printf("[Stage3-Inspect] Read error during first packet inspection for %s -> %s: %v",
-			clientAddr, origDst, err)
+	observedClient := &inspectionReader{
+		source: downstreamTLS,
+		report: func(matched bool, authHash []byte, meta *AnyTLSMetadata) {
+			if matched {
+				p.confirmedAnyTLS.Store(origDst, true)
+				p.whitelist.Remove(origDst)
+				log.Printf("[ANYTLS-DETECTED] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
+					clientAddr, origDst, sni, authHash)
+
+				// Display Client Fingerprint & Session Metadata info
+				var fpDetails []string
+				if clientFingerprint != nil {
+					fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
+					if clientFingerprint.HasGREASE {
+						fpDetails = append(fpDetails, "GREASE=True")
+					}
+					if len(clientFingerprint.ALPN) > 0 {
+						fpDetails = append(fpDetails, fmt.Sprintf("ALPN=%v", clientFingerprint.ALPN))
+					}
+					if clientFingerprint.JA3Hash != "" {
+						fpDetails = append(fpDetails, fmt.Sprintf("JA3=%s", clientFingerprint.JA3Hash))
+					}
+				}
+				if meta != nil && meta.ClientApp != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("ClientApp: %q", meta.ClientApp))
+				}
+				if meta != nil && meta.Version != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("Ver: %s", meta.Version))
+				}
+				if meta != nil && meta.PaddingMD5 != "" {
+					fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
+				}
+
+				if len(fpDetails) > 0 {
+					log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
+				}
+			} else {
+				log.Printf("[NON-ANYTLS-MITM] Client: %s -> Server: %s | Decrypted first packet did not match AnyTLS protocol (forwarding transparently)",
+					clientAddr, origDst)
+			}
+
+		},
 	}
 
-	if matched {
-		p.confirmedAnyTLS.Store(origDst, true)
-		p.whitelist.Remove(origDst)
-		log.Printf("[ANYTLS-MITM-SUCCESS] Client: %s -> Server: %s | SNI: %s | AuthHash(SHA256): %x",
-			clientAddr, origDst, sni, authHash)
-
-		// Display Client Fingerprint & Session Metadata info
-		var fpDetails []string
-		if clientFingerprint != nil {
-			fpDetails = append(fpDetails, fmt.Sprintf("TLS-Fingerprint: %s", clientFingerprint.FingerprintType))
-			if clientFingerprint.HasGREASE {
-				fpDetails = append(fpDetails, "GREASE=True")
-			}
-			if len(clientFingerprint.ALPN) > 0 {
-				fpDetails = append(fpDetails, fmt.Sprintf("ALPN=%v", clientFingerprint.ALPN))
-			}
-			if clientFingerprint.JA3Hash != "" {
-				fpDetails = append(fpDetails, fmt.Sprintf("JA3=%s", clientFingerprint.JA3Hash))
-			}
-		}
-		if meta != nil && meta.ClientApp != "" {
-			fpDetails = append(fpDetails, fmt.Sprintf("ClientApp: %q", meta.ClientApp))
-		}
-		if meta != nil && meta.Version != "" {
-			fpDetails = append(fpDetails, fmt.Sprintf("Ver: %s", meta.Version))
-		}
-		if meta != nil && meta.PaddingMD5 != "" {
-			fpDetails = append(fpDetails, fmt.Sprintf("PaddingMD5: %s", meta.PaddingMD5))
-		}
-
-		if len(fpDetails) > 0 {
-			log.Printf("[ANYTLS-FINGERPRINT]  %s", strings.Join(fpDetails, " | "))
-		}
-	} else {
-		log.Printf("[NON-ANYTLS-MITM] Client: %s -> Server: %s | Decrypted first packet did not match AnyTLS protocol (forwarding transparently)",
-			clientAddr, origDst)
-	}
-
-	log.Printf("[Proxy-Relay] >>> Streaming started for %s <-> %s", clientAddr, origDst)
+	log.Printf("[Proxy-Relay] >>> Streaming started for %s <-> %s | setup=%s", clientAddr, origDst, time.Since(started))
 
 	// Transparently bridge the two decrypted TLS streams
 	var wg sync.WaitGroup
@@ -360,8 +364,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		defer wg.Done()
 		defer uTLS.Close()
 		defer downstreamTLS.Close()
-		c2uBytes, c2uErr := io.Copy(uTLS, brDecrypted)
-		log.Printf("[Proxy-Relay] Client -> Upstream stream ended: %s copied %d bytes, err: %v", clientAddr, c2uBytes, c2uErr)
+		c2uBytes, c2uErr := io.Copy(uTLS, observedClient)
+		log.Printf("[Proxy-Relay] Client -> Upstream stream ended: %s copied %d bytes, age=%s, err: %v", clientAddr, c2uBytes, time.Since(started), c2uErr)
 	}()
 
 	go func() {
@@ -369,7 +373,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		defer downstreamTLS.Close()
 		defer uTLS.Close()
 		u2cBytes, u2cErr := io.Copy(downstreamTLS, uTLS)
-		log.Printf("[Proxy-Relay] Upstream -> Client stream ended: %s copied %d bytes, err: %v", clientAddr, u2cBytes, u2cErr)
+		log.Printf("[Proxy-Relay] Upstream -> Client stream ended: %s copied %d bytes, age=%s, err: %v", clientAddr, u2cBytes, time.Since(started), u2cErr)
 	}()
 
 	wg.Wait()
@@ -378,6 +382,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.
 func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io.Reader) {
+	// The pre-handshake timeout must not become an application-session timeout.
+	clientConn.SetDeadline(time.Time{})
 	log.Printf("[Proxy-RawTCP] >>> Raw TCP streaming started for %s <-> %s", clientConn.RemoteAddr(), origDst)
 	upstreamConn, err := net.DialTimeout("tcp", origDst, 5*time.Second)
 	if err != nil {
@@ -434,4 +440,3 @@ func isClientCertRejection(err error) bool {
 	}
 	return false
 }
-
