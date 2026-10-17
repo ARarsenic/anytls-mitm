@@ -141,7 +141,7 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		whitelist:       NewWhitelistCache(cfg.WhitelistTTL),
 		confirmedAnyTLS: NewConfirmedAnyTLSCache(2000, 24*time.Hour),
 		certCloner:      cloner,
-		upstreamPool:    NewUpstreamPool(2, 25*time.Second),
+		upstreamPool:    NewUpstreamPool(8, 30*time.Second),
 		stopChan:        make(chan struct{}),
 		connsPerIP:      make(map[string]int),
 		loggedFP:        make(map[string]time.Time),
@@ -626,7 +626,13 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 			if er != nil {
 				if er != io.EOF {
 					c2uErr = er
-					log.Printf("[Proxy-Relay] [C->U %s] Read from client error: %v", clientAddr, er)
+					if isClientTeardown(er) {
+						if p.config.Verbose {
+							log.Printf("[Proxy-Relay] [C->U %s] Client closed connection (teardown)", clientAddr)
+						}
+					} else {
+						log.Printf("[Proxy-Relay] [C->U %s] Read from client error: %v", clientAddr, er)
+					}
 				}
 				break
 			}
@@ -663,7 +669,13 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 					}
 					if ew != nil {
 						u2cErr = ew
-						log.Printf("[Proxy-Relay] [U->C %s] Write to client error: %v", clientAddr, ew)
+						if isClientTeardown(ew) {
+							if p.config.Verbose {
+								log.Printf("[Proxy-Relay] [U->C %s] Client closed connection during write (teardown)", clientAddr)
+							}
+						} else {
+							log.Printf("[Proxy-Relay] [U->C %s] Write to client error: %v", clientAddr, ew)
+						}
 						break
 					}
 					toWrite = toWrite[chunk:]
@@ -683,8 +695,29 @@ func (p *Proxy) relayTLS(downstreamTLS *tls.Conn, uTLS *tls.Conn, brDecrypted *b
 	}()
 
 	wg.Wait()
-	log.Printf("[Proxy-Relay] <<< Stream ended for %s <-> %s | Client->Upstream: %d bytes (err: %v) | Upstream->Client: %d bytes (err: %v)",
-		clientAddr, origDst, c2uBytes, c2uErr, u2cBytes, u2cErr)
+	log.Printf("[Proxy-Relay] <<< Stream ended for %s <-> %s | Client->Upstream: %d bytes (err: %s) | Upstream->Client: %d bytes (err: %s)",
+		clientAddr, origDst, c2uBytes, cleanErrStr(c2uErr), u2cBytes, cleanErrStr(u2cErr))
+}
+
+func isClientTeardown(err error) bool {
+	if err == nil || err == io.EOF {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "forcibly closed") ||
+		strings.Contains(s, "10054") ||
+		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "connection reset by peer")
+}
+
+func cleanErrStr(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if isClientTeardown(err) {
+		return "client teardown (EOF/RST)"
+	}
+	return err.Error()
 }
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.

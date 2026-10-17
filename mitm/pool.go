@@ -21,6 +21,7 @@ type UpstreamPool struct {
 	pools        map[string][]*pooledConn // origDst -> slice of idle connections
 	targetSNI    map[string]string        // origDst -> last known SNI
 	targetProtos map[string][]string      // origDst -> last known NextProtos
+	inFlight     map[string]int           // origDst -> number of background dials currently in progress
 	maxIdle      int
 	idleTimeout  time.Duration
 	stopChan     chan struct{}
@@ -29,15 +30,16 @@ type UpstreamPool struct {
 // NewUpstreamPool initializes a new upstream connection pool.
 func NewUpstreamPool(maxIdle int, idleTimeout time.Duration) *UpstreamPool {
 	if maxIdle <= 0 {
-		maxIdle = 2
+		maxIdle = 8
 	}
 	if idleTimeout <= 0 {
-		idleTimeout = 25 * time.Second
+		idleTimeout = 30 * time.Second
 	}
 	p := &UpstreamPool{
 		pools:        make(map[string][]*pooledConn),
 		targetSNI:    make(map[string]string),
 		targetProtos: make(map[string][]string),
+		inFlight:     make(map[string]int),
 		maxIdle:      maxIdle,
 		idleTimeout:  idleTimeout,
 		stopChan:     make(chan struct{}),
@@ -55,7 +57,7 @@ func (p *UpstreamPool) RecordTarget(origDst, sni string, protos []string) {
 	}
 	p.mu.Unlock()
 
-	go p.replenish(origDst)
+	p.replenish(origDst)
 }
 
 // Get retrieves a pre-warmed, healthy upstream TLS connection for the given destination.
@@ -103,7 +105,7 @@ func (p *UpstreamPool) Get(origDst string) *tls.Conn {
 	return nil
 }
 
-// replenish connects in the background to bring the pool size up to maxIdle.
+// replenish concurrently connects in the background to bring the pool size up to maxIdle.
 func (p *UpstreamPool) replenish(origDst string) {
 	p.mu.Lock()
 	select {
@@ -113,8 +115,8 @@ func (p *UpstreamPool) replenish(origDst string) {
 	default:
 	}
 
-	currentCount := len(p.pools[origDst])
-	if currentCount >= p.maxIdle {
+	needed := p.maxIdle - (len(p.pools[origDst]) + p.inFlight[origDst])
+	if needed <= 0 {
 		p.mu.Unlock()
 		return
 	}
@@ -125,34 +127,47 @@ func (p *UpstreamPool) replenish(origDst string) {
 		return
 	}
 	protos := p.targetProtos[origDst]
+
+	p.inFlight[origDst] += needed
 	p.mu.Unlock()
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	u, err := tls.DialWithDialer(dialer, "tcp", origDst, &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true,
-		NextProtos:         protos,
-	})
-	if err != nil {
-		return
-	}
+	for i := 0; i < needed; i++ {
+		go func() {
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			u, err := tls.DialWithDialer(dialer, "tcp", origDst, &tls.Config{
+				ServerName:         sni,
+				InsecureSkipVerify: true,
+				NextProtos:         protos,
+			})
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	select {
-	case <-p.stopChan:
-		_ = u.Close()
-		return
-	default:
-	}
+			p.mu.Lock()
+			defer p.mu.Unlock()
 
-	if len(p.pools[origDst]) < p.maxIdle {
-		p.pools[origDst] = append(p.pools[origDst], &pooledConn{
-			conn:      u,
-			createdAt: time.Now(),
-		})
-	} else {
-		_ = u.Close()
+			p.inFlight[origDst]--
+			if p.inFlight[origDst] < 0 {
+				p.inFlight[origDst] = 0
+			}
+
+			if err != nil {
+				return
+			}
+
+			select {
+			case <-p.stopChan:
+				_ = u.Close()
+				return
+			default:
+			}
+
+			if len(p.pools[origDst]) < p.maxIdle {
+				p.pools[origDst] = append(p.pools[origDst], &pooledConn{
+					conn:      u,
+					createdAt: time.Now(),
+				})
+			} else {
+				_ = u.Close()
+			}
+		}()
 	}
 }
 
