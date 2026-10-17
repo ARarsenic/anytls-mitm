@@ -100,6 +100,7 @@ type Proxy struct {
 	whitelist       *WhitelistCache
 	confirmedAnyTLS *ConfirmedAnyTLSCache
 	certCloner      *CertCloner
+	upstreamPool    *UpstreamPool
 	stopChan        chan struct{}
 
 	// Concurrency & DoS tracking (H-01 fix)
@@ -140,6 +141,7 @@ func NewProxy(cfg ProxyConfig) (*Proxy, error) {
 		whitelist:       NewWhitelistCache(cfg.WhitelistTTL),
 		confirmedAnyTLS: NewConfirmedAnyTLSCache(2000, 24*time.Hour),
 		certCloner:      cloner,
+		upstreamPool:    NewUpstreamPool(2, 25*time.Second),
 		stopChan:        make(chan struct{}),
 		connsPerIP:      make(map[string]int),
 		loggedFP:        make(map[string]time.Time),
@@ -221,6 +223,7 @@ func (p *Proxy) Stop() {
 		p.listener.Close()
 	}
 
+	p.upstreamPool.Stop()
 	p.whitelist.Stop()
 	p.whitelist.Clear()
 	p.confirmedAnyTLS.Clear()
@@ -357,6 +360,17 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		dialOnce.Do(func() {
 			go func() {
 				defer close(upstreamDone)
+
+				// 1. Fast Path: Try to acquire an already-handshaked upstream connection from pool (0ms!)
+				if prewarmed := p.upstreamPool.Get(origDst); prewarmed != nil {
+					upstreamTLS = prewarmed
+					state := prewarmed.ConnectionState()
+					log.Printf("[Proxy-TLS] Acquired PRE-WARMED upstream TLS for %s (0ms dial!) | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
+						origDst, state.Version, state.CipherSuite, state.NegotiatedProtocol)
+					return
+				}
+
+				// 2. Pool empty or cold target: dial on-demand
 				dialer := &net.Dialer{Timeout: 15 * time.Second}
 				u, err := tls.DialWithDialer(dialer, "tcp", origDst, &tls.Config{
 					ServerName:         serverName,
@@ -372,6 +386,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				state := u.ConnectionState()
 				log.Printf("[Proxy-TLS] Upstream TLS connected to %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
 					origDst, state.Version, state.CipherSuite, state.NegotiatedProtocol)
+
+				// Register target in pool so background worker keeps pre-warmed connections ready for next requests
+				p.upstreamPool.RecordTarget(origDst, serverName, protos)
 			}()
 		})
 	}
@@ -380,6 +397,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			sni = hello.ServerName
 			clientFingerprint = AnalyzeTLSFingerprint(hello)
+			p.upstreamPool.RecordTarget(origDst, sni, hello.SupportedProtos)
 
 			// Fast Path: If certificate is already cloned and cached, return it immediately!
 			if cachedCert, cachedProto := p.certCloner.GetWithALPN(origDst); cachedCert != nil {
