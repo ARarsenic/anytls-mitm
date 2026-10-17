@@ -128,24 +128,18 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	}
 
 	if origDst == "" {
-		if p.config.Verbose {
-			log.Printf("[Proxy] Warning: No NAT mapping found for client %s, dropping", clientAddr)
-		}
+		log.Printf("[Proxy] Warning: No NAT mapping found for client %s, dropping", clientAddr)
 		return
 	}
 
-	if p.config.Verbose {
-		log.Printf("[Proxy] Accepted TCP connection: %s -> %s", clientAddr, origDst)
-	}
+	log.Printf("[Proxy] Accepted TCP connection: %s -> %s", clientAddr, origDst)
 
 	// -------------------------------------------------------------
 	// Stage 1: Fail-Open Whitelist & Pre-Handshake Check
 	// -------------------------------------------------------------
 	if p.whitelist.Contains(origDst) {
-		if p.config.Verbose {
-			log.Printf("[Stage1-Whitelist-Bypass] Client: %s -> Server: %s (Destination is in fail-open whitelist, splicing raw TCP)",
-				clientAddr, origDst)
-		}
+		log.Printf("[WHITELIST-BYPASS] Client: %s -> Server: %s (Destination is in fail-open whitelist, splicing raw TCP)",
+			clientAddr, origDst)
 		p.relayRawTCP(clientConn, origDst, nil)
 		return
 	}
@@ -154,17 +148,13 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	brClient := bufio.NewReader(clientConn)
 	headerBytes, err := brClient.Peek(5)
 	if err != nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy] Failed to peek initial bytes from %s: %v", clientAddr, err)
-		}
+		log.Printf("[Proxy] Failed to peek initial bytes from %s: %v", clientAddr, err)
 		return
 	}
 
 	if headerBytes[0] != 0x16 {
-		if p.config.Verbose {
-			log.Printf("[Stage1-PreCheck] Non-TLS record header 0x%02x from %s, bypassing MITM via raw TCP to %s",
-				headerBytes[0], clientAddr, origDst)
-		}
+		log.Printf("[Stage1-PreCheck] Non-TLS record header 0x%02x from %s, bypassing MITM via raw TCP to %s",
+			headerBytes[0], clientAddr, origDst)
 		p.relayRawTCP(clientConn, origDst, brClient)
 		return
 	}
@@ -190,7 +180,8 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		dialOnce.Do(func() {
 			go func() {
 				defer close(upstreamDone)
-				dialer := &net.Dialer{Timeout: 5 * time.Second}
+				dialer := &net.Dialer{Timeout: 10 * time.Second}
+				log.Printf("[Proxy-TLS] Dialing upstream TLS to %s (SNI: %q, protos: %v)...", origDst, serverName, protos)
 				u, err := tls.DialWithDialer(dialer, "tcp", origDst, &tls.Config{
 					ServerName:         serverName,
 					InsecureSkipVerify: true,
@@ -198,9 +189,13 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 				})
 				if err != nil {
 					upstreamErr = err
+					log.Printf("[Proxy-TLS] Upstream TLS dial failed for %s: %v", origDst, err)
 					return
 				}
 				upstreamTLS = u
+				state := u.ConnectionState()
+				log.Printf("[Proxy-TLS] Upstream TLS connected to %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
+					origDst, state.Version, state.CipherSuite, state.NegotiatedProtocol)
 			}()
 		})
 	}
@@ -212,6 +207,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 			// Fast Path: If certificate is already cloned and cached, return it immediately!
 			if cachedCert := p.certCloner.Get(origDst); cachedCert != nil {
+				log.Printf("[Proxy-Cert] Fast path: using cached certificate for %s (SNI: %q)", origDst, sni)
 				startDialUpstream(sni, hello.SupportedProtos)
 				return &tls.Config{
 					Certificates: []tls.Certificate{*cachedCert},
@@ -219,16 +215,12 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			}
 
 			// Slow Path (first connection only): Dial upstream synchronously to fetch & clone cert
-			if p.config.Verbose {
-				log.Printf("[Stage2-Cloning] First connection to %s, dialing upstream to fetch certificate (SNI: %q)...",
-					origDst, sni)
-			}
+			log.Printf("[Stage2-Cloning] First connection to %s, dialing upstream to fetch certificate (SNI: %q)...",
+				origDst, sni)
 			startDialUpstream(sni, hello.SupportedProtos)
 			<-upstreamDone
 			if upstreamErr != nil {
-				if p.config.Verbose {
-					log.Printf("[Stage2-Cloning] Failed to dial upstream TLS %s: %v", origDst, upstreamErr)
-				}
+				log.Printf("[Stage2-Cloning] Failed to dial upstream TLS %s: %v", origDst, upstreamErr)
 				return nil, fmt.Errorf("upstream tls dial failed to %s: %w", origDst, upstreamErr)
 			}
 
@@ -268,17 +260,12 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 	downstreamTLS := tls.Server(wrappedClientConn, serverTLSConfig)
 	handshakeErr := downstreamTLS.Handshake()
 	if handshakeErr != nil {
-		// Handshake failed (e.g. client strict verification rejected cloned cert)
-		if p.config.Verbose {
-			log.Printf("[Stage2-FailOpen] Downstream TLS handshake failed for %s -> %s: %v",
-				clientAddr, origDst, handshakeErr)
-		}
+		log.Printf("[Proxy-TLS] Downstream TLS handshake FAILED for %s -> %s: %v",
+			clientAddr, origDst, handshakeErr)
 		if _, isAnyTLS := p.confirmedAnyTLS.Load(origDst); !isAnyTLS {
 			if isClientCertRejection(handshakeErr) {
-				if p.config.Verbose {
-					log.Printf("[Stage2-FailOpen] Client rejected certificate (%v), adding %s to whitelist cache for fast bypass",
-						handshakeErr, origDst)
-				}
+				log.Printf("[Stage2-FailOpen] Client rejected certificate (%v), adding %s to whitelist cache for fast bypass",
+					handshakeErr, origDst)
 				p.whitelist.Add(origDst)
 			} else if p.config.Verbose {
 				log.Printf("[Stage2-FailOpen] Handshake error was network/reset (%v), NOT certificate rejection. Will NOT whitelist %s",
@@ -297,25 +284,20 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	if p.config.Verbose {
-		log.Printf("[Stage2-Success] Downstream TLS handshake SUCCESS for %s -> %s! Client accepted cloned certificate.",
-			clientAddr, origDst)
-	}
+	downstreamState := downstreamTLS.ConnectionState()
+	log.Printf("[Proxy-TLS] Downstream TLS handshake SUCCESS for %s -> %s | Version: 0x%04x | Cipher: 0x%04x | ALPN: %q",
+		clientAddr, origDst, downstreamState.Version, downstreamState.CipherSuite, downstreamState.NegotiatedProtocol)
 
 	// Wait for upstream connection to complete
 	<-upstreamDone
 	if upstreamErr != nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy] Upstream TLS dial failed for %s: %v", origDst, upstreamErr)
-		}
+		log.Printf("[Proxy] Upstream TLS dial failed for %s: %v", origDst, upstreamErr)
 		return
 	}
 
 	uTLS := upstreamTLS
 	if uTLS == nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy] Upstream TLS connection is nil for %s", origDst)
-		}
+		log.Printf("[Proxy] Upstream TLS connection is nil for %s", origDst)
 		return
 	}
 	defer uTLS.Close()
@@ -368,14 +350,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			clientAddr, origDst)
 	}
 
-	if p.config.Verbose {
-		downstreamState := downstreamTLS.ConnectionState()
-		upstreamState := uTLS.ConnectionState()
-		log.Printf("[Proxy-Relay] TLS Established | Downstream: ALPN=%q, Version=0x%04x, Cipher=0x%04x | Upstream: ALPN=%q, Version=0x%04x, Cipher=0x%04x | BufferedBytes=%d",
-			downstreamState.NegotiatedProtocol, downstreamState.Version, downstreamState.CipherSuite,
-			upstreamState.NegotiatedProtocol, upstreamState.Version, upstreamState.CipherSuite,
-			brDecrypted.Buffered())
-	}
+	log.Printf("[Proxy-Relay] >>> Streaming started for %s <-> %s", clientAddr, origDst)
 
 	// Transparently bridge the two decrypted TLS streams
 	var wg sync.WaitGroup
@@ -386,9 +361,7 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		defer uTLS.Close()
 		defer downstreamTLS.Close()
 		c2uBytes, c2uErr := io.Copy(uTLS, brDecrypted)
-		if p.config.Verbose {
-			log.Printf("[Proxy-Relay] Client -> Upstream stream ended: copied %d bytes, err: %v", c2uBytes, c2uErr)
-		}
+		log.Printf("[Proxy-Relay] Client -> Upstream stream ended: %s copied %d bytes, err: %v", clientAddr, c2uBytes, c2uErr)
 	}()
 
 	go func() {
@@ -396,24 +369,19 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		defer downstreamTLS.Close()
 		defer uTLS.Close()
 		u2cBytes, u2cErr := io.Copy(downstreamTLS, uTLS)
-		if p.config.Verbose {
-			log.Printf("[Proxy-Relay] Upstream -> Client stream ended: copied %d bytes, err: %v", u2cBytes, u2cErr)
-		}
+		log.Printf("[Proxy-Relay] Upstream -> Client stream ended: %s copied %d bytes, err: %v", clientAddr, u2cBytes, u2cErr)
 	}()
 
 	wg.Wait()
-	if p.config.Verbose {
-		log.Printf("[Proxy] Connection closed: %s <-> %s", clientAddr, origDst)
-	}
+	log.Printf("[Proxy] Connection closed: %s <-> %s", clientAddr, origDst)
 }
 
 // relayRawTCP establishes a raw TCP connection to the destination and relays data.
 func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io.Reader) {
+	log.Printf("[Proxy-RawTCP] >>> Raw TCP streaming started for %s <-> %s", clientConn.RemoteAddr(), origDst)
 	upstreamConn, err := net.DialTimeout("tcp", origDst, 5*time.Second)
 	if err != nil {
-		if p.config.Verbose {
-			log.Printf("[Proxy-RawTCP] Failed to dial raw TCP to %s: %v", origDst, err)
-		}
+		log.Printf("[Proxy-RawTCP] Failed to dial raw TCP to %s: %v", origDst, err)
 		return
 	}
 	defer upstreamConn.Close()
@@ -431,9 +399,7 @@ func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io
 		defer upstreamConn.Close()
 		defer clientConn.Close()
 		n, err := io.Copy(upstreamConn, clientReader)
-		if p.config.Verbose {
-			log.Printf("[Proxy-RawTCP] Client -> Upstream stream ended: %d bytes, err: %v", n, err)
-		}
+		log.Printf("[Proxy-RawTCP] Client -> Upstream stream ended: %d bytes, err: %v", n, err)
 	}()
 
 	go func() {
@@ -441,15 +407,11 @@ func (p *Proxy) relayRawTCP(clientConn net.Conn, origDst string, prefixReader io
 		defer clientConn.Close()
 		defer upstreamConn.Close()
 		n, err := io.Copy(clientConn, upstreamConn)
-		if p.config.Verbose {
-			log.Printf("[Proxy-RawTCP] Upstream -> Client stream ended: %d bytes, err: %v", n, err)
-		}
+		log.Printf("[Proxy-RawTCP] Upstream -> Client stream ended: %d bytes, err: %v", n, err)
 	}()
 
 	wg.Wait()
-	if p.config.Verbose {
-		log.Printf("[Proxy-RawTCP] Connection closed: %s <-> %s", clientConn.RemoteAddr(), origDst)
-	}
+	log.Printf("[Proxy-RawTCP] Connection closed: %s <-> %s", clientConn.RemoteAddr(), origDst)
 }
 
 // isClientCertRejection checks if the TLS handshake error indicates that the client
